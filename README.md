@@ -82,6 +82,37 @@ jOOQ's classes are generated from the Flyway migration itself rather than from a
 database, so the schema has exactly one definition and a renamed column breaks compilation
 instead of production.
 
+## The invoice lifecycle
+
+Twenty states, ported state for state from `src/lib/state-machine/invoice-transitions.ts`
+in the SettleTrust frontend. The client keeps its copy so it can grey out a button without
+a round trip, but that copy is now a convenience: **this service decides**, because
+anything a browser enforces is a suggestion to whoever is not using the browser.
+
+```
+draft -> submitted -> buyer_accepted -> risk_review_* -> escrow_pending
+      -> escrow_funded -> shipment_pending -> delivery_confirmed
+      -> settlement_pending -> settled
+
+disputed, frozen, expired, failed and cancelled hang off the side,
+and only settled and cancelled are final.
+```
+
+**The status is not a column.** An invoice's status is the `to_status` of its
+highest-sequence transition, exactly as an account balance is the sum of its entries. Same
+reason: a stored status can disagree with the history that produced it, and then nobody
+can say which is true. The whole history is always answerable, not just where an invoice
+is but every step that got it there.
+
+**Two clients cannot both move one invoice.** Each transition claims the next sequence
+number, and `(invoice_id, sequence)` is unique, so exactly one insert survives a race. The
+loser is told the invoice moved rather than quietly overwriting a decision it never saw.
+Twelve racing clients, one applied move, eleven conflicts, and a test that proves it.
+
+**A command may carry the status the caller believes it is acting on.** If the invoice has
+moved since, the answer is 409 and the caller re-reads instead of acting on a stale view.
+It is optional, because a job acting on a query it just ran does not need it.
+
 ## The API
 
 Spring Boot, and only at the edge. No class in the domain carries a Spring annotation, so
@@ -95,6 +126,10 @@ at.
 | `GET /api/v1/accounts/{id}` | The account and its balance. |
 | `GET /api/v1/accounts/{id}/entries` | Every entry against it, oldest first. |
 | `POST /api/v1/transfers` | Moves money. Requires an `Idempotency-Key` header. |
+| `POST /api/v1/invoices` | Opens an invoice in `draft`. |
+| `GET /api/v1/invoices/{id}` | Where it is, what blocks settlement, and what it may become next. |
+| `GET /api/v1/invoices/{id}/transitions` | Every step it has taken. |
+| `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
 
 ```http
 POST /api/v1/transfers
@@ -118,6 +153,9 @@ Refusals carry a `reason` a client can branch on, rather than a parsed message:
 | `UNKNOWN_ACCOUNT` | 404 | The resource named is not there to act on |
 | `AMOUNT_NOT_POSITIVE`, `SAME_ACCOUNT` | 400 | Malformed in the plain sense |
 | `CURRENCY_MISMATCH`, `INSUFFICIENT_FUNDS` | 422 | Understood, and refused by the ledger's rules; retrying unchanged fails identically |
+| `UNKNOWN_INVOICE` | 404 | Same |
+| `ILLEGAL_TRANSITION`, `TERMINAL_STATE` | 422 | The invoice cannot make that move from where it stands |
+| `STATE_CHANGED` | 409 | It moved under the caller; re-read and decide again, the same command may be valid next time |
 
 ```bash
 mvn spring-boot:run
@@ -127,8 +165,9 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-31 tests, all green: 18 against the in-memory ledger, 6 against a real PostgreSQL, 7
-against the running application context. The
+116 tests, all green: the domain rules in microseconds with no database, the storage layer
+against a real PostgreSQL, and the HTTP contract against the running application context.
+The
 concurrency tests release every thread from a barrier at the same instant, one virtual
 thread per task, so they genuinely contend.
 
@@ -148,6 +187,13 @@ thread per task, so they genuinely contend.
 | A new transfer is 201, a replay is 200 and the same transfer | `LedgerApiTest` |
 | Every refusal reaches the status code it deserves, with a machine-readable reason | same |
 | A missing idempotency key is refused outright | same |
+| Every status has a transition row, and only `settled` and `cancelled` are final | `InvoiceStateMachineTest` |
+| The happy path is walkable step by step; a draft cannot jump to settled | same |
+| Only `delivery_confirmed` and `settlement_pending` are ready to settle | same |
+| An invoice's status really is its latest transition | `PostgresInvoicesTest` |
+| An illegal move leaves no trace, and history cannot be rewritten | same |
+| 12 racing clients produce one move and eleven conflicts | same |
+| Each invoice refusal reaches 404, 422 or 409 as it should | `InvoiceApiTest` |
 
 ```bash
 mvn test
@@ -167,12 +213,13 @@ mvn test
 ## Status
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
-generated from those migrations, the HTTP API, and the tests above.
+generated from those migrations, the HTTP API, the invoice lifecycle, and the tests above.
 
 **Next, in order:**
 
-1. The invoice state machine ported from the SettleTrust frontend, server-side, as the
-   authority rather than a client-side convenience.
+1. Settlement that actually moves money: reaching `settled` posts the transfer, in the
+   same transaction as the transition, so an invoice cannot be marked paid without the
+   entries to prove it.
 2. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
    state, and a watcher that posts its events into this same ledger, using the transaction
    hash as the idempotency key, with a confirmation depth before an entry counts and a

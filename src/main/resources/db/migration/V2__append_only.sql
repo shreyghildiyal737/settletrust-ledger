@@ -6,6 +6,7 @@
 -- correction is a new pair of entries in the opposite direction, which is also how a
 -- paper ledger has always worked.
 
+-- [jooq ignore start]
 create or replace function reject_history_rewrite() returns trigger as $$
 begin
     raise exception '% on % is not permitted: entries are append-only, post a reversing pair instead',
@@ -20,3 +21,5 @@ create trigger entry_is_append_only
 create trigger transfer_is_append_only
     before update or delete on transfer
     for each row execute function reject_history_rewrite();
+
+-- [jooq ignore stop]

@@ -1,6 +1,7 @@
 package com.settletrust.ledger.api;
 
 import com.settletrust.ledger.TransferRejected;
+import com.settletrust.ledger.invoice.InvoiceTransitionRejected;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -38,6 +39,25 @@ class LedgerErrorHandler {
             // Well formed, understood, and refused by the ledger's own rules. Retrying it
             // unchanged will fail identically, which is what 422 tells a client.
             case CURRENCY_MISMATCH, INSUFFICIENT_FUNDS -> HttpStatus.UNPROCESSABLE_ENTITY;
+        };
+    }
+
+    @ExceptionHandler(InvoiceTransitionRejected.class)
+    ResponseEntity<ErrorView> refused(InvoiceTransitionRejected refusal) {
+        return ResponseEntity
+                .status(statusFor(refusal.reason()))
+                .body(new ErrorView(refusal.reason().name(), refusal.getMessage()));
+    }
+
+    private static HttpStatus statusFor(InvoiceTransitionRejected.Reason reason) {
+        return switch (reason) {
+            case UNKNOWN_INVOICE -> HttpStatus.NOT_FOUND;
+            // The move was understood and is not one this invoice can make from where it
+            // stands. Retrying it unchanged will fail identically.
+            case ILLEGAL_TRANSITION, TERMINAL_STATE -> HttpStatus.UNPROCESSABLE_ENTITY;
+            // The invoice moved under the caller. Re-read it and decide again: this is a
+            // conflict, not a bad request, and the same command may well be valid next time.
+            case STATE_CHANGED -> HttpStatus.CONFLICT;
         };
     }
 

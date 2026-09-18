@@ -3,6 +3,7 @@ package com.settletrust.ledger.api;
 import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
+import com.settletrust.ledger.invoice.PostgresInvoices;
 import org.jooq.DSLContext;
 import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
@@ -48,5 +49,10 @@ public class LedgerApplication {
     @Bean
     Transfers transfers(DSLContext dsl, Clock clock) {
         return new PostgresTransferService(dsl, clock);
+    }
+
+    @Bean
+    PostgresInvoices invoices(DSLContext dsl, Clock clock) {
+        return new PostgresInvoices(dsl, clock);
     }
 }
