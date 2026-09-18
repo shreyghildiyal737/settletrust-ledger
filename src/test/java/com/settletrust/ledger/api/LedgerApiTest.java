@@ -151,7 +151,7 @@ class LedgerApiTest {
         mvc.perform(post("/api/v1/accounts")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(json.writeValueAsString(
-                                Map.of("id", "x", "currency", "EUROS"))))
+                                Map.of("id", "x", "currency", "EU"))))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.reason", is("INVALID_REQUEST")));
 

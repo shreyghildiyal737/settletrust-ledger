@@ -10,6 +10,7 @@ import com.settletrust.ledger.Transfer;
 import com.settletrust.ledger.invoice.InvoiceState;
 import com.settletrust.ledger.invoice.InvoiceStatus;
 import com.settletrust.ledger.invoice.InvoiceTransition;
+import com.settletrust.ledger.invoice.InvoiceTransitions;
 import com.settletrust.ledger.invoice.InvoiceTransitionRejected;
 import com.settletrust.ledger.invoice.PostgresInvoices;
 import org.jooq.DSLContext;
@@ -50,12 +51,125 @@ public class InvoiceSettlement {
         this.transfers = Objects.requireNonNull(transfers, "transfers must not be null");
     }
 
-    /** The money moved, and the step the invoice took because of it. */
+    /**
+     * The money moved, and the step the invoice took because of it.
+     *
+     * <p>{@code transition} is null in exactly one case: a reversal of a deposit for an
+     * invoice that is already final. The lifecycle cannot move a settled invoice and
+     * should not, because it really was paid; the money still has to be put back, and the
+     * correction lives in the ledger and the shortfall account instead. A book that
+     * refuses to record a loss because the paperwork has been filed is not a book.
+     */
     public record Settlement(InvoiceTransition transition, Transfer transfer) {
     }
 
     public static AccountId escrowAccountFor(String invoiceId) {
         return AccountId.of("escrow:" + invoiceId);
+    }
+
+    /**
+     * The platform's own side of the chain rail. Money arriving from a blockchain has to
+     * come from somewhere in a double-entry system, and this is that somewhere: its
+     * negative balance is exactly the total the platform is holding on chain.
+     */
+    public static AccountId chainAccountFor(String currency) {
+        return AccountId.of("chain:" + currency);
+    }
+
+    /**
+     * Where a reversal is absorbed when the escrow has already been paid out.
+     *
+     * <p>Its balance is the platform's exposure to reorganisations it settled too early,
+     * which is a number somebody should be watching rather than one that should be
+     * impossible to compute.
+     */
+    public static AccountId chainShortfallAccountFor(String currency) {
+        return AccountId.of("chain-shortfall:" + currency);
+    }
+
+    /**
+     * Credits a confirmed on-chain deposit into the invoice's escrow and marks the invoice
+     * funded, inside a transaction the watcher owns.
+     *
+     * <p>The transaction hash and log index are the idempotency key, which is what makes
+     * this safe to call with an event the chain has handed over more than once.
+     */
+    public Settlement fundEscrowFromChain(
+            org.jooq.Configuration config,
+            String invoiceId,
+            String txHash,
+            int logIndex,
+            Money amount) {
+
+        String key = "chain-deposit:" + txHash + ":" + logIndex;
+        Optional<Settlement> alreadyDone =
+                alreadyDone(config, invoiceId, key, InvoiceStatus.ESCROW_FUNDED);
+        if (alreadyDone.isPresent()) {
+            return alreadyDone.get();
+        }
+
+        AccountId escrow = escrowAccountFor(invoiceId);
+        AccountId chain = chainAccountFor(amount.currency());
+        openIfMissing(config, escrow, amount.currency(), Account.Kind.CUSTOMER);
+        openIfMissing(config, chain, amount.currency(), Account.Kind.HOUSE);
+
+        InvoiceTransition transition = invoices.transitionWithin(
+                config, invoiceId, InvoiceStatus.ESCROW_FUNDED, null, "on-chain deposit " + txHash);
+
+        Transfer transfer = transfers.transferWithin(config, chain, escrow, amount, key);
+        return new Settlement(transition, transfer);
+    }
+
+    /**
+     * Undoes a deposit the chain has taken back, and freezes the invoice.
+     *
+     * <p>Nothing is deleted: the reversal is a new pair of entries in the opposite
+     * direction, so the books show both that the money arrived and that it went away
+     * again. The invoice is frozen rather than sent backwards, because there is no
+     * automatic next step here that is safe; a person has to look at an invoice whose
+     * funding evaporated.
+     *
+     * <p>If the escrow has already been released to the seller, the money cannot be taken
+     * back from them and the reversal is absorbed by the shortfall account instead. That
+     * is the platform's loss, and recording it as one is the only version of these books
+     * that stays true.
+     */
+    public Settlement reverseChainDeposit(
+            org.jooq.Configuration config,
+            String invoiceId,
+            String txHash,
+            int logIndex,
+            Money amount) {
+
+        String key = "chain-reversal:" + txHash + ":" + logIndex;
+        AccountId escrow = escrowAccountFor(invoiceId);
+        AccountId chain = chainAccountFor(amount.currency());
+
+        Money held = ledger.balanceOfWithin(config, escrow);
+        AccountId payer = held.isLessThan(amount)
+                ? chainShortfallAccountFor(amount.currency())
+                : escrow;
+        openIfMissing(config, payer, amount.currency(), Account.Kind.HOUSE);
+
+        // Freeze the invoice so a person looks at it, unless it is already final. A
+        // settled invoice stays settled: the seller was genuinely paid, and pretending
+        // otherwise would make the lifecycle lie to cover for the chain.
+        InvoiceStatus current = requireInvoice(config, invoiceId).status();
+        InvoiceTransition transition = InvoiceTransitions.isAllowed(current, InvoiceStatus.FROZEN)
+                ? invoices.transitionWithin(
+                        config, invoiceId, InvoiceStatus.FROZEN,
+                        null, "on-chain deposit reversed " + txHash)
+                : null;
+
+        Transfer transfer = transfers.transferWithin(config, payer, chain, amount, key);
+        return new Settlement(transition, transfer);
+    }
+
+    private void openIfMissing(
+            org.jooq.Configuration config, AccountId id, String currency, Account.Kind kind) {
+        if (!ledger.exists(config, id)) {
+            ledger.openWithin(config, new Account(id, currency, kind));
+        }
     }
 
     /**
@@ -82,12 +196,9 @@ public class InvoiceSettlement {
             Money amount = state.invoice().amount();
             AccountId escrow = escrowAccountFor(invoiceId);
 
-            if (!ledger.exists(config, escrow)) {
-                // A customer account rather than a house one: escrow holds real money that
-                // arrived from somewhere, so it must never be able to go negative.
-                ledger.openWithin(config, new Account(
-                        escrow, amount.currency(), Account.Kind.CUSTOMER));
-            }
+            // A customer account rather than a house one: escrow holds real money that
+            // arrived from somewhere, so it must never be able to go negative.
+            openIfMissing(config, escrow, amount.currency(), Account.Kind.CUSTOMER);
 
             InvoiceTransition transition = invoices.transitionWithin(
                     config, invoiceId, InvoiceStatus.ESCROW_FUNDED, null, "escrow funded");

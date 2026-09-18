@@ -11,15 +11,26 @@ import java.util.Objects;
  * settles cross-border, so two accounts in different currencies is the normal case,
  * not the exception. Converting between them is an FX concern and deliberately not
  * part of a transfer.
+ *
+ * <p>A code is three to five characters rather than strictly ISO 4217, because the chain
+ * rail settles in stablecoins and {@code USDC} is four. Calling that a currency code is
+ * already a small fiction; forcing it into three characters would be a larger one.
  */
 public record Money(long minorUnits, String currency) implements Comparable<Money> {
 
     public Money {
+        currency = requireCode(currency);
+    }
+
+    /** Uppercases the code and rejects anything that is not three to five letters. */
+    static String requireCode(String currency) {
         Objects.requireNonNull(currency, "currency must not be null");
-        if (currency.length() != 3) {
-            throw new IllegalArgumentException("currency must be a 3-letter code, got: " + currency);
+        String upper = currency.toUpperCase();
+        if (!upper.matches("[A-Z]{3,5}")) {
+            throw new IllegalArgumentException(
+                    "currency must be 3 to 5 letters, got: " + currency);
         }
-        currency = currency.toUpperCase();
+        return upper;
     }
 
     public static Money of(long minorUnits, String currency) {

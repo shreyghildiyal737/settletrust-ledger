@@ -59,7 +59,7 @@ class InvoiceController {
             long amountMinor,
 
             @NotBlank(message = "currency is required")
-            @Pattern(regexp = "[A-Za-z]{3}", message = "currency must be a 3-letter code")
+            @Pattern(regexp = "[A-Za-z]{3,5}", message = "currency must be 3 to 5 letters")
             String currency) {
     }
 

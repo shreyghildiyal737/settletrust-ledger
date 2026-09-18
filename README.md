@@ -140,6 +140,55 @@ buyer  --250.00-->  escrow:inv-8a31c40e   (escrow_funded)
 ask again and gets the original transition and transfer back, flagged as a replay, with no
 second payment. The transfer's idempotency key is the evidence that the work was done.
 
+## The chain rail
+
+The second way money arrives. An escrow can be funded from a bank account through the API,
+or on chain by a buyer paying a Solidity contract, and **both land in the same ledger**.
+That is the whole design: one ledger, two rails, and a reconciliation that can compare
+them because they are written in the same entries.
+
+`contracts/InvoiceEscrow.sol` holds a stablecoin payment per invoice and emits an event
+carrying the invoice id. It deliberately does not model the lifecycle: that already exists
+off chain, and duplicating it would create two authorities that can disagree. What it
+guarantees is narrower and more useful, that funds can be deposited once and can only
+leave to the seller or back to the buyer.
+
+`EscrowWatcher` turns those events into entries. Reading a chain is harder than reading a
+queue for three reasons, and each one shapes the code:
+
+**The same event arrives more than once.** A restart, an overlapping scan or a
+reorganisation all replay events. Transaction hash and log index are the identity, and
+every write downstream is keyed on them, so a deposit can be handed over any number of
+times and credited exactly once.
+
+**A new block is not a fact yet.** Nothing is acted on until it is buried under the
+configured number of confirmations. Until then the deposit is recorded as pending and the
+invoice is untouched.
+
+**The chain can take it back anyway.** A block number is a position; the hash is the
+identity. If the hash at that height has changed, what was credited is no longer true. The
+credit is reversed with **a new pair of entries in the opposite direction**, never a
+deletion, and the invoice is frozen so a person looks at it. If the transaction simply
+moved to a different block, it is re-anchored rather than written off.
+
+Two cases the tests pin down because they are the ones that hurt:
+
+- **A deposit for an invoice that is not ready** is held, not lost, and credited on a later
+  pass once the invoice catches up. Money arriving on chain does not entitle an invoice to
+  skip its own steps.
+- **A reversal after the escrow was already paid out** cannot be taken back from the
+  seller. It is absorbed by `chain-shortfall:<currency>`, whose negative balance is the
+  platform's exposure to reorganisations it settled too early: a number somebody can watch
+  rather than a loss nobody can find. The invoice stays settled, because it really was.
+
+Currency codes are three to five letters rather than strictly ISO 4217, because this rail
+settles in stablecoins and `USDC` is four.
+
+**Status, honestly:** the watcher and its reversal logic are tested against a fake chain
+that reorganises on demand, which is the one thing a real testnet will not do when asked.
+The contract is written but **not deployed and not yet exercised against a node**. The
+remaining work is a `ChainSource` backed by a real client and a run against a local chain.
+
 ## The API
 
 Spring Boot, and only at the edge. No class in the domain carries a Spring annotation, so
@@ -195,7 +244,7 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-122 tests, all green: the domain rules in microseconds with no database, the storage layer
+129 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -224,6 +273,13 @@ thread per task, so they genuinely contend.
 | An illegal move leaves no trace, and history cannot be rewritten | same |
 | 12 racing clients produce one move and eleven conflicts | same |
 | Each invoice refusal reaches 404, 422 or 409 as it should | `InvoiceApiTest` |
+| A deposit waits for its confirmations before anything moves | `EscrowWatcherTest` |
+| Polling repeatedly credits the same deposit exactly once | same |
+| A reorg reverses the credit with new entries and freezes the invoice | same |
+| A deposit dropped before it was credited costs nothing | same |
+| A transaction re-mined elsewhere is followed, not written off | same |
+| Money for an invoice that is not ready waits, then lands | same |
+| A reversal after payout is recorded as the platform's loss | same |
 | An invoice walked end to end moves the money exactly once | `InvoiceSettlementTest` |
 | An invoice cannot be declared funded or settled | same |
 | A buyer who cannot pay leaves the invoice exactly where it was | same |
@@ -249,14 +305,13 @@ mvn test
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
 generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
-settlement, and the tests above.
+settlement, the on-chain deposit rail with its reorg handling, and the tests above. The
+escrow contract is written but not yet deployed or run against a node.
 
 **Next, in order:**
 
-1. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
-   state, and a watcher that posts its events into this same ledger, using the transaction
-   hash as the idempotency key, with a confirmation depth before an entry counts and a
-   reversal path when a reorg takes it back.
+1. A `ChainSource` backed by a real Ethereum client, and the contract deployed to a local
+   chain so the rail is exercised end to end rather than against a fake.
 2. Reconciliation as a scheduled job, proving the two rails agree.
 
 One ledger, two settlement rails.

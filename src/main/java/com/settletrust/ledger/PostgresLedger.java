@@ -82,6 +82,12 @@ public class PostgresLedger {
         return balanceOf(dsl, require(id));
     }
 
+    /** The balance as it stands inside a transaction the caller already owns. */
+    public Money balanceOfWithin(Configuration config, AccountId id) {
+        DSLContext transaction = DSL.using(config);
+        return balanceOf(transaction, require(transaction, id));
+    }
+
     public List<Entry> entriesOf(AccountId id) {
         return dsl.selectFrom(ENTRY)
                 .where(ENTRY.ACCOUNT_ID.eq(id.value()))

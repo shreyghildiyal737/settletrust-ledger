@@ -26,12 +26,8 @@ public record Account(AccountId id, String currency, Kind kind) {
 
     public Account {
         Objects.requireNonNull(id, "id must not be null");
-        Objects.requireNonNull(currency, "currency must not be null");
         Objects.requireNonNull(kind, "kind must not be null");
-        if (currency.length() != 3) {
-            throw new IllegalArgumentException("currency must be a 3-letter code, got: " + currency);
-        }
-        currency = currency.toUpperCase();
+        currency = Money.requireCode(currency);
     }
 
     public static Account customer(String id, String currency) {
