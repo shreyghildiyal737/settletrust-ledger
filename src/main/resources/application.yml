@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: settletrust-ledger
+
+  datasource:
+    url: ${LEDGER_JDBC_URL:jdbc:postgresql://localhost:5432/settletrust_ledger}
+    username: ${LEDGER_DB_USER:postgres}
+    password: ${LEDGER_DB_PASSWORD:postgres}
+    hikari:
+      pool-name: settletrust-ledger
+      # Each transfer holds a row lock for the length of its transaction, so a caller
+      # waiting on a busy account should be waiting on the lock, not on the pool.
+      maximum-pool-size: 16
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: ${PORT:8080}
+  error:
+    # Errors are answered by LedgerErrorHandler, which returns a reason a client can
+    # branch on. Spring's default whitelabel body would leak class names instead.
+    include-message: never
+
+logging:
+  level:
+    org.jooq.tools.LoggerListener: ${SQL_LOG_LEVEL:warn}

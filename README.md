@@ -81,9 +81,53 @@ jOOQ's classes are generated from the Flyway migration itself rather than from a
 database, so the schema has exactly one definition and a renamed column breaks compilation
 instead of production.
 
+## The API
+
+Spring Boot, and only at the edge. No class in the domain carries a Spring annotation, so
+the rules stay testable in milliseconds and the edge could be replaced without touching
+them. Flyway and the connection pool are Boot's to manage, because that is what it is good
+at.
+
+| | |
+|---|---|
+| `POST /api/v1/accounts` | Opens an account. 201, or 409 if the id is taken. |
+| `GET /api/v1/accounts/{id}` | The account and its balance. |
+| `GET /api/v1/accounts/{id}/entries` | Every entry against it, oldest first. |
+| `POST /api/v1/transfers` | Moves money. Requires an `Idempotency-Key` header. |
+
+```http
+POST /api/v1/transfers
+Idempotency-Key: 8f14e45f-ceea-467a-9f7c-3b2a0d5e1c94
+
+{"from": "alice", "to": "bob", "amountMinor": 2500, "currency": "EUR"}
+```
+
+The key is a header, not a body field, following the convention payments APIs have settled
+on: it describes the request rather than the money, so a client retrying blindly does not
+have to rebuild the payload to reuse it.
+
+**A new transfer is 201. A replay is 200**, carrying the original transfer with
+`"replayed": true`, so a client can tell its retry was recognised without the answer
+changing.
+
+Refusals carry a `reason` a client can branch on, rather than a parsed message:
+
+| Reason | Status | Why that one |
+|---|---|---|
+| `UNKNOWN_ACCOUNT` | 404 | The resource named is not there to act on |
+| `AMOUNT_NOT_POSITIVE`, `SAME_ACCOUNT` | 400 | Malformed in the plain sense |
+| `CURRENCY_MISMATCH`, `INSUFFICIENT_FUNDS` | 422 | Understood, and refused by the ledger's rules; retrying unchanged fails identically |
+
+```bash
+mvn spring-boot:run
+```
+
+Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates on start.
+
 ## Tests
 
-24 tests, all green: 18 against the in-memory ledger, 6 against a real PostgreSQL. The
+31 tests, all green: 18 against the in-memory ledger, 6 against a real PostgreSQL, 7
+against the running application context. The
 concurrency tests release every thread from a barrier at the same instant, one virtual
 thread per task, so they genuinely contend.
 
@@ -100,6 +144,9 @@ thread per task, so they genuinely contend.
 | A row lock stops 30 racing transfers from overdrawing | same |
 | The unique constraint settles a real race on one key | same |
 | The database refuses an update or delete on `entry` | same |
+| A new transfer is 201, a replay is 200 and the same transfer | `LedgerApiTest` |
+| Every refusal reaches the status code it deserves, with a machine-readable reason | same |
+| A missing idempotency key is refused outright | same |
 
 ```bash
 mvn test
@@ -119,17 +166,16 @@ mvn test
 ## Status
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
-generated from those migrations, and the tests above.
+generated from those migrations, the HTTP API, and the tests above.
 
 **Next, in order:**
 
-1. Spring Boot at the edge only, so the domain stays framework-free.
-2. The invoice state machine ported from the SettleTrust frontend, server-side, as the
+1. The invoice state machine ported from the SettleTrust frontend, server-side, as the
    authority rather than a client-side convenience.
-3. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
+2. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
    state, and a watcher that posts its events into this same ledger, using the transaction
    hash as the idempotency key, with a confirmation depth before an entry counts and a
    reversal path when a reorg takes it back.
-4. Reconciliation as a scheduled job, proving the two rails agree.
+3. Reconciliation as a scheduled job, proving the two rails agree.
 
 One ledger, two settlement rails.

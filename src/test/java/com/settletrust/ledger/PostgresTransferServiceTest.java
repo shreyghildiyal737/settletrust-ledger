@@ -6,7 +6,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.PostgreSQLContainer;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -34,17 +33,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class PostgresTransferServiceTest {
 
-    /**
-     * Point these at an existing Postgres to use it instead of starting a container.
-     * Testcontainers is the default and what CI uses; this exists because a developer
-     * machine can have a working Docker daemon that Testcontainers still cannot reach,
-     * and a test suite that cannot be run is a test suite nobody runs.
-     */
-    private static final String URL_OVERRIDE = "LEDGER_TEST_JDBC_URL";
-    private static final String USER_OVERRIDE = "LEDGER_TEST_DB_USER";
-    private static final String PASSWORD_OVERRIDE = "LEDGER_TEST_DB_PASSWORD";
-
-    private static PostgreSQLContainer<?> container;
     private static Database database;
 
     private PostgresLedger ledger;
@@ -56,31 +44,14 @@ class PostgresTransferServiceTest {
 
     @BeforeAll
     static void startDatabase() {
-        String url = System.getenv(URL_OVERRIDE);
-        if (url != null && !url.isBlank()) {
-            database = new Database(
-                    url,
-                    System.getenv().getOrDefault(USER_OVERRIDE, "postgres"),
-                    System.getenv().getOrDefault(PASSWORD_OVERRIDE, "postgres"));
-            return;
-        }
-
-        container = new PostgreSQLContainer<>("postgres:16-alpine")
-                .withDatabaseName("settletrust")
-                .withUsername("settletrust")
-                .withPassword("settletrust");
-        container.start();
-        database = new Database(
-                container.getJdbcUrl(), container.getUsername(), container.getPassword());
+        TestDatabases.Target target = TestDatabases.resolve();
+        database = new Database(target.url(), target.username(), target.password());
     }
 
     @AfterAll
     static void stopDatabase() {
         if (database != null) {
             database.close();
-        }
-        if (container != null) {
-            container.stop();
         }
     }
 
