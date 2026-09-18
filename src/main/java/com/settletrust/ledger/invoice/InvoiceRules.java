@@ -20,7 +20,22 @@ public final class InvoiceRules {
             InvoiceStatus.DELIVERY_CONFIRMED,
             InvoiceStatus.SETTLEMENT_PENDING);
 
+    /**
+     * States an invoice cannot simply be declared to be in, because reaching them means
+     * money moved. Marking an invoice settled without the entries to prove it is exactly
+     * the kind of unbacked claim this whole service exists to make impossible, so these
+     * two are reachable only through the settlement operations, which write the transition
+     * and the transfer in one transaction.
+     */
+    private static final Set<InvoiceStatus> REQUIRE_MONEY_MOVEMENT = Set.of(
+            InvoiceStatus.ESCROW_FUNDED,
+            InvoiceStatus.SETTLED);
+
     private InvoiceRules() {
+    }
+
+    public static boolean requiresMoneyMovement(InvoiceStatus to) {
+        return REQUIRE_MONEY_MOVEMENT.contains(to);
     }
 
     static void requireLegal(String invoiceId, InvoiceStatus from, InvoiceStatus to) {

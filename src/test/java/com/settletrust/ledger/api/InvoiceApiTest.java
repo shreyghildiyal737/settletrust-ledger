@@ -98,9 +98,14 @@ class InvoiceApiTest {
     @Test
     @DisplayName("an illegal move is 422 and a stale expectation is 409")
     void refusalsMapToStatusCodes() throws Exception {
-        transition("settled", null, "wishful")
+        transition("delivery_confirmed", null, "wishful")
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.reason", is("ILLEGAL_TRANSITION")));
+
+        // Money states cannot be asserted, only earned through the settlement endpoints.
+        transition("settled", null, "trust me")
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.reason", is("MONEY_MOVEMENT_REQUIRED")));
 
         transition("submitted", "draft", null).andExpect(status().isCreated());
 
@@ -138,21 +143,51 @@ class InvoiceApiTest {
     }
 
     @Test
-    @DisplayName("an invoice walked to delivery reports itself ready to settle")
+    @DisplayName("an invoice funded and delivered reports itself ready to settle")
     void anInvoiceCanReachReadiness() throws Exception {
         for (String[] step : new String[][] {
                 {"submitted", "draft"},
                 {"buyer_accepted", "submitted"},
-                {"escrow_pending", "buyer_accepted"},
-                {"escrow_funded", "escrow_pending"},
-                {"delivery_confirmed", "escrow_funded"}}) {
+                {"escrow_pending", "buyer_accepted"}}) {
             transition(step[0], step[1], null).andExpect(status().isCreated());
         }
+
+        openAccount("house-" + invoiceId, "HOUSE");
+        openAccount("buyer-" + invoiceId, "CUSTOMER");
+        fundAccount("house-" + invoiceId, "buyer-" + invoiceId, 250_000L);
+
+        mvc.perform(post("/api/v1/invoices/{id}/escrow-funding", invoiceId)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(
+                                Map.of("account", "buyer-" + invoiceId))))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.transition.to", is("escrow_funded")))
+                .andExpect(jsonPath("$.amountMinor", is(250000)));
+
+        transition("delivery_confirmed", "escrow_funded", null).andExpect(status().isCreated());
 
         mvc.perform(get("/api/v1/invoices/{id}", invoiceId))
                 .andExpect(jsonPath("$.status", is("delivery_confirmed")))
                 .andExpect(jsonPath("$.readyForSettlement", is(true)))
                 .andExpect(jsonPath("$.blockedReasons.length()", is(0)));
+    }
+
+    private void openAccount(String id, String kind) throws Exception {
+        mvc.perform(post("/api/v1/accounts")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(
+                                Map.of("id", id, "currency", "EUR", "kind", kind))))
+                .andExpect(status().isCreated());
+    }
+
+    private void fundAccount(String from, String to, long amountMinor) throws Exception {
+        mvc.perform(post("/api/v1/transfers")
+                        .header("Idempotency-Key", UUID.randomUUID().toString())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "from", from, "to", to,
+                                "amountMinor", amountMinor, "currency", "EUR"))))
+                .andExpect(status().isCreated());
     }
 
     private ResultActions transition(String to, String expected, String reason) throws Exception {

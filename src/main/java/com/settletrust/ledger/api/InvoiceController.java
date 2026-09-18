@@ -6,6 +6,8 @@ import com.settletrust.ledger.invoice.InvoiceState;
 import com.settletrust.ledger.invoice.InvoiceStatus;
 import com.settletrust.ledger.invoice.InvoiceTransition;
 import com.settletrust.ledger.invoice.PostgresInvoices;
+import com.settletrust.ledger.AccountId;
+import com.settletrust.ledger.settlement.InvoiceSettlement;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Pattern;
@@ -33,10 +35,12 @@ import java.util.function.Supplier;
 class InvoiceController {
 
     private final PostgresInvoices invoices;
+    private final InvoiceSettlement settlement;
     private final Clock clock;
 
-    InvoiceController(PostgresInvoices invoices, Clock clock) {
+    InvoiceController(PostgresInvoices invoices, InvoiceSettlement settlement, Clock clock) {
         this.invoices = invoices;
+        this.settlement = settlement;
         this.clock = clock;
     }
 
@@ -167,6 +171,56 @@ class InvoiceController {
         return ResponseEntity
                 .status(HttpStatus.CREATED)
                 .body(TransitionView.of(move));
+    }
+
+    record PartyAccountRequest(
+            @NotBlank(message = "account is required")
+            String account) {
+    }
+
+    record SettlementView(
+            TransitionView transition,
+            String fromAccount,
+            String toAccount,
+            long amountMinor,
+            String currency) {
+
+        static SettlementView of(InvoiceSettlement.Settlement settlement) {
+            return new SettlementView(
+                    TransitionView.of(settlement.transition()),
+                    settlement.transfer().from().value(),
+                    settlement.transfer().to().value(),
+                    settlement.transfer().amount().minorUnits(),
+                    settlement.transfer().amount().currency());
+        }
+    }
+
+    /**
+     * Funds the invoice's escrow from the buyer's account and marks it funded. Both happen
+     * in one transaction, so the invoice cannot end up claiming an escrow that was never
+     * paid for.
+     */
+    @PostMapping("/{id}/escrow-funding")
+    ResponseEntity<SettlementView> fundEscrow(
+            @PathVariable("id") String id,
+            @Valid @RequestBody PartyAccountRequest request) {
+
+        AccountId buyer = fromClient(() -> AccountId.of(request.account()));
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(SettlementView.of(settlement.fundEscrow(id, buyer)));
+    }
+
+    /** Releases the escrow to the seller and marks the invoice settled, in one transaction. */
+    @PostMapping("/{id}/settlement")
+    ResponseEntity<SettlementView> settle(
+            @PathVariable("id") String id,
+            @Valid @RequestBody PartyAccountRequest request) {
+
+        AccountId seller = fromClient(() -> AccountId.of(request.account()));
+        return ResponseEntity
+                .status(HttpStatus.CREATED)
+                .body(SettlementView.of(settlement.settle(id, seller)));
     }
 
     /** As in {@link LedgerController}: only the client's own input becomes a 400. */

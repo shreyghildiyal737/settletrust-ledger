@@ -113,6 +113,33 @@ Twelve racing clients, one applied move, eleven conflicts, and a test that prove
 moved since, the answer is 409 and the caller re-reads instead of acting on a stale view.
 It is optional, because a job acting on a query it just ran does not need it.
 
+## Settlement, where the two halves meet
+
+An invoice reaching `escrow_funded` or `settled` is a claim about money. These are the only
+two states that **cannot be asserted**: the generic transition endpoint refuses them, and
+they are reachable only through the settlement operations, which write the transition and
+the transfer **in one database transaction**.
+
+That is the whole point of putting the ledger and the lifecycle in one service. An invoice
+can never be marked paid without the entries that prove it, and money can never move
+without the invoice recording why. If the buyer cannot cover the escrow, the transfer is
+refused and the invoice does not move either: the rollback takes both.
+
+**Each invoice gets its own escrow account**, created the first time it is funded. Escrow
+is the reason the buyer's money leaves their control before the seller has earned it, so
+holding it in a named account per invoice means "whose money is this, and against what"
+always has an answer.
+
+```
+buyer  --250.00-->  escrow:inv-8a31c40e   (escrow_funded)
+                            |
+                            +--250.00-->  seller   (settled)
+```
+
+**Both operations are idempotent.** A client whose connection dropped mid-settlement can
+ask again and gets the original transition and transfer back, flagged as a replay, with no
+second payment. The transfer's idempotency key is the evidence that the work was done.
+
 ## The API
 
 Spring Boot, and only at the edge. No class in the domain carries a Spring annotation, so
@@ -130,6 +157,8 @@ at.
 | `GET /api/v1/invoices/{id}` | Where it is, what blocks settlement, and what it may become next. |
 | `GET /api/v1/invoices/{id}/transitions` | Every step it has taken. |
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
+| `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
+| `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
 
 ```http
 POST /api/v1/transfers
@@ -156,6 +185,7 @@ Refusals carry a `reason` a client can branch on, rather than a parsed message:
 | `UNKNOWN_INVOICE` | 404 | Same |
 | `ILLEGAL_TRANSITION`, `TERMINAL_STATE` | 422 | The invoice cannot make that move from where it stands |
 | `STATE_CHANGED` | 409 | It moved under the caller; re-read and decide again, the same command may be valid next time |
+| `MONEY_MOVEMENT_REQUIRED` | 422 | The move is legal but money has to change hands with it, so it belongs to a settlement endpoint |
 
 ```bash
 mvn spring-boot:run
@@ -165,7 +195,7 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-116 tests, all green: the domain rules in microseconds with no database, the storage layer
+122 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -194,6 +224,11 @@ thread per task, so they genuinely contend.
 | An illegal move leaves no trace, and history cannot be rewritten | same |
 | 12 racing clients produce one move and eleven conflicts | same |
 | Each invoice refusal reaches 404, 422 or 409 as it should | `InvoiceApiTest` |
+| An invoice walked end to end moves the money exactly once | `InvoiceSettlementTest` |
+| An invoice cannot be declared funded or settled | same |
+| A buyer who cannot pay leaves the invoice exactly where it was | same |
+| Settling or funding twice returns the first result and pays once | same |
+| An invoice cannot be settled before delivery is confirmed | same |
 
 ```bash
 mvn test
@@ -213,17 +248,15 @@ mvn test
 ## Status
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
-generated from those migrations, the HTTP API, the invoice lifecycle, and the tests above.
+generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
+settlement, and the tests above.
 
 **Next, in order:**
 
-1. Settlement that actually moves money: reaching `settled` posts the transfer, in the
-   same transaction as the transition, so an invoice cannot be marked paid without the
-   entries to prove it.
-2. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
+1. An escrow rail on-chain: a Solidity contract holding funds against the invoice's escrow
    state, and a watcher that posts its events into this same ledger, using the transaction
    hash as the idempotency key, with a confirmation depth before an entry counts and a
    reversal path when a reorg takes it back.
-3. Reconciliation as a scheduled job, proving the two rails agree.
+2. Reconciliation as a scheduled job, proving the two rails agree.
 
 One ledger, two settlement rails.

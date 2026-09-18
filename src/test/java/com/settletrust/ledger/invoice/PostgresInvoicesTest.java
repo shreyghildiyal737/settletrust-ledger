@@ -104,7 +104,8 @@ class PostgresInvoicesTest {
     void anIllegalMoveLeavesNoTrace() {
         InvoiceTransitionRejected rejection = assertThrows(
                 InvoiceTransitionRejected.class,
-                () -> invoices.transition(invoiceId, InvoiceStatus.SETTLED, null, "wishful"));
+                () -> invoices.transition(
+                        invoiceId, InvoiceStatus.DELIVERY_CONFIRMED, null, "wishful"));
 
         assertAll(
                 () -> assertEquals(

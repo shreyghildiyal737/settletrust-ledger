@@ -55,6 +55,9 @@ class LedgerErrorHandler {
             // The move was understood and is not one this invoice can make from where it
             // stands. Retrying it unchanged will fail identically.
             case ILLEGAL_TRANSITION, TERMINAL_STATE -> HttpStatus.UNPROCESSABLE_ENTITY;
+            // The move is legal but money has to change hands with it, so it belongs to
+            // the settlement endpoints rather than a bare assertion of the new status.
+            case MONEY_MOVEMENT_REQUIRED -> HttpStatus.UNPROCESSABLE_ENTITY;
             // The invoice moved under the caller. Re-read it and decide again: this is a
             // conflict, not a bad request, and the same command may well be valid next time.
             case STATE_CHANGED -> HttpStatus.CONFLICT;

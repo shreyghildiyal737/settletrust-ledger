@@ -40,7 +40,24 @@ public class PostgresLedger {
     }
 
     public void open(Account account) {
-        int inserted = dsl.insertInto(ACCOUNT)
+        open(dsl, account);
+    }
+
+    /** Opens an account inside a transaction the caller already owns. */
+    public void openWithin(Configuration config, Account account) {
+        open(DSL.using(config), account);
+    }
+
+    /**
+     * True if the account exists, so a caller can open it only when it does not. Used for
+     * per-invoice escrow accounts, which come into being the first time one is funded.
+     */
+    public boolean exists(Configuration config, AccountId id) {
+        return find(DSL.using(config), id).isPresent();
+    }
+
+    private void open(DSLContext context, Account account) {
+        int inserted = context.insertInto(ACCOUNT)
                 .set(ACCOUNT.ID, account.id().value())
                 .set(ACCOUNT.CURRENCY, account.currency())
                 .set(ACCOUNT.KIND, account.kind().name())

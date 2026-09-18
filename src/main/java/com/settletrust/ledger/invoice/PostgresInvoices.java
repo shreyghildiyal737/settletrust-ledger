@@ -1,12 +1,13 @@
 package com.settletrust.ledger.invoice;
 
 import com.settletrust.ledger.Money;
+import com.settletrust.ledger.SqlErrors;
+import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.Record;
 import org.jooq.exception.DataAccessException;
 import org.jooq.impl.DSL;
 
-import java.sql.SQLException;
 import java.time.Clock;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
@@ -29,8 +30,6 @@ import static com.settletrust.ledger.jooq.Tables.INVOICE_TRANSITION;
  * decision it never saw. No locks, no lost update.
  */
 public class PostgresInvoices {
-
-    private static final String UNIQUE_VIOLATION = "23505";
 
     private final DSLContext dsl;
     private final Clock clock;
@@ -98,8 +97,51 @@ public class PostgresInvoices {
     public InvoiceTransition transition(
             String invoiceId, InvoiceStatus to, InvoiceStatus expected, String reason) {
 
+        // Asserting a status is not the same as earning it. Reaching escrow_funded or
+        // settled means money moved, and those are only reachable through the settlement
+        // operations, which write the transition and the transfer together or not at all.
+        if (InvoiceRules.requiresMoneyMovement(to)) {
+            throw new InvoiceTransitionRejected(
+                    InvoiceTransitionRejected.Reason.MONEY_MOVEMENT_REQUIRED,
+                    invoiceId + " cannot simply be declared " + to.code());
+        }
+
+        try {
+            return dsl.transactionResult(config ->
+                    transitionWithin(config, invoiceId, to, expected, reason));
+        } catch (DataAccessException failure) {
+            if (!SqlErrors.isUniqueViolation(failure)) {
+                throw failure;
+            }
+            // Someone else took this sequence number. Whatever they did, this caller's
+            // view of the invoice was already out of date by the time it tried to write.
+            throw new InvoiceTransitionRejected(
+                    InvoiceTransitionRejected.Reason.STATE_CHANGED,
+                    invoiceId + " moved while this transition was being applied");
+        }
+    }
+
+    /**
+     * The move itself, run inside a transaction somebody else owns, so that moving an
+     * invoice and moving the money it represents can be one atomic act.
+     *
+     * <p>A constraint violation propagates rather than being turned into a refusal here.
+     * Postgres aborts a transaction on a violation, so the recovery has to happen outside
+     * one, and only the owner of the transaction knows where that is.
+     */
+    public InvoiceTransition transitionWithin(
+            Configuration config,
+            String invoiceId,
+            InvoiceStatus to,
+            InvoiceStatus expected,
+            String reason) {
+
         Objects.requireNonNull(to, "the target status must not be null");
-        InvoiceState current = require(invoiceId);
+        DSLContext transaction = DSL.using(config);
+
+        InvoiceState current = find(transaction, invoiceId)
+                .orElseThrow(() -> new InvoiceTransitionRejected(
+                        InvoiceTransitionRejected.Reason.UNKNOWN_INVOICE, invoiceId));
 
         if (expected != null && expected != current.status()) {
             throw new InvoiceTransitionRejected(
@@ -117,29 +159,39 @@ public class PostgresInvoices {
                 reason,
                 clock.instant());
 
-        try {
-            dsl.insertInto(INVOICE_TRANSITION)
-                    .set(INVOICE_TRANSITION.ID, move.id())
-                    .set(INVOICE_TRANSITION.INVOICE_ID, move.invoiceId())
-                    .set(INVOICE_TRANSITION.SEQUENCE, move.sequence())
-                    .set(INVOICE_TRANSITION.FROM_STATUS, move.from().code())
-                    .set(INVOICE_TRANSITION.TO_STATUS, move.to().code())
-                    .set(INVOICE_TRANSITION.REASON, move.reason())
-                    .set(INVOICE_TRANSITION.OCCURRED_AT,
-                            LocalDateTime.ofInstant(move.occurredAt(), ZoneOffset.UTC))
-                    .execute();
-        } catch (DataAccessException failure) {
-            if (!isUniqueViolation(failure)) {
-                throw failure;
-            }
-            // Someone else took this sequence number. Whatever they did, this caller's
-            // view of the invoice was already out of date by the time it tried to write.
-            throw new InvoiceTransitionRejected(
-                    InvoiceTransitionRejected.Reason.STATE_CHANGED,
-                    invoiceId + " moved while this transition was being applied");
-        }
+        transaction.insertInto(INVOICE_TRANSITION)
+                .set(INVOICE_TRANSITION.ID, move.id())
+                .set(INVOICE_TRANSITION.INVOICE_ID, move.invoiceId())
+                .set(INVOICE_TRANSITION.SEQUENCE, move.sequence())
+                .set(INVOICE_TRANSITION.FROM_STATUS, move.from().code())
+                .set(INVOICE_TRANSITION.TO_STATUS, move.to().code())
+                .set(INVOICE_TRANSITION.REASON, move.reason())
+                .set(INVOICE_TRANSITION.OCCURRED_AT,
+                        LocalDateTime.ofInstant(move.occurredAt(), ZoneOffset.UTC))
+                .execute();
 
         return move;
+    }
+
+    /**
+     * The transition that first took this invoice to the given status, if it ever did.
+     * Used to answer a retried settlement with the step it originally produced.
+     */
+    public Optional<InvoiceTransition> findTransitionTo(
+            Configuration config, String invoiceId, InvoiceStatus status) {
+        return DSL.using(config)
+                .selectFrom(INVOICE_TRANSITION)
+                .where(INVOICE_TRANSITION.INVOICE_ID.eq(invoiceId))
+                .and(INVOICE_TRANSITION.TO_STATUS.eq(status.code()))
+                .orderBy(INVOICE_TRANSITION.SEQUENCE.asc())
+                .limit(1)
+                .fetchOptional()
+                .map(PostgresInvoices::toTransition);
+    }
+
+    /** The invoice as it stands inside a transaction the caller already owns. */
+    public Optional<InvoiceState> findWithin(Configuration config, String invoiceId) {
+        return find(DSL.using(config), invoiceId);
     }
 
     private static Optional<InvoiceState> find(DSLContext context, String invoiceId) {
@@ -187,12 +239,4 @@ public class PostgresInvoices {
                 row.get(INVOICE_TRANSITION.OCCURRED_AT).toInstant(ZoneOffset.UTC));
     }
 
-    private static boolean isUniqueViolation(Throwable failure) {
-        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SQLException sql && UNIQUE_VIOLATION.equals(sql.getSQLState())) {
-                return true;
-            }
-        }
-        return false;
-    }
 }

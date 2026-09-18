@@ -4,6 +4,7 @@ import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
 import com.settletrust.ledger.invoice.PostgresInvoices;
+import com.settletrust.ledger.settlement.InvoiceSettlement;
 import org.jooq.DSLContext;
 import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
@@ -46,13 +47,27 @@ public class LedgerApplication {
         return new PostgresLedger(dsl, clock);
     }
 
+    /**
+     * Declared by its concrete type, not the {@link Transfers} port. The controller still
+     * receives it as the port; settlement needs the implementation, because joining a
+     * transfer to an outer transaction is something only the Postgres one can do.
+     */
     @Bean
-    Transfers transfers(DSLContext dsl, Clock clock) {
+    PostgresTransferService transfers(DSLContext dsl, Clock clock) {
         return new PostgresTransferService(dsl, clock);
     }
 
     @Bean
     PostgresInvoices invoices(DSLContext dsl, Clock clock) {
         return new PostgresInvoices(dsl, clock);
+    }
+
+    @Bean
+    InvoiceSettlement settlement(
+            DSLContext dsl,
+            PostgresLedger ledger,
+            PostgresInvoices invoices,
+            PostgresTransferService transfers) {
+        return new InvoiceSettlement(dsl, ledger, invoices, transfers);
     }
 }

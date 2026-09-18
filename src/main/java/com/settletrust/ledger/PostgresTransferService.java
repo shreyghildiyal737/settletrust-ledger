@@ -1,10 +1,10 @@
 package com.settletrust.ledger;
 
+import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.exception.DataAccessException;
 import org.jooq.impl.DSL;
 
-import java.sql.SQLException;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -30,8 +30,6 @@ import static com.settletrust.ledger.jooq.Tables.TRANSFER;
  */
 public class PostgresTransferService implements Transfers {
 
-    private static final String UNIQUE_VIOLATION = "23505";
-
     private final DSLContext dsl;
     private final Clock clock;
 
@@ -46,39 +44,61 @@ public class PostgresTransferService implements Transfers {
 
     @Override
     public Transfer transfer(AccountId from, AccountId to, Money amount, String idempotencyKey) {
+        try {
+            return dsl.transactionResult(config ->
+                    transferWithin(config, from, to, amount, idempotencyKey));
+        } catch (DataAccessException failure) {
+            if (!SqlErrors.isUniqueViolation(failure)) {
+                throw failure;
+            }
+            // Lost the race on the key. The winner's transfer is the answer, and no
+            // second movement happened: this transaction rolled back in full.
+            //
+            // The recovery has to live out here, after the transaction has ended. Postgres
+            // aborts a transaction on a constraint violation, so nothing useful can be
+            // read inside one that has already failed.
+            return findByKey(dsl, idempotencyKey)
+                    .orElseThrow(() -> failure)
+                    .asReplay();
+        }
+    }
+
+    /**
+     * The transfer itself, run inside a transaction somebody else owns.
+     *
+     * <p>This exists so a transfer can be part of a larger atomic act, such as settling an
+     * invoice, where marking the invoice paid and moving the money must both happen or
+     * neither must. A constraint violation is left to propagate rather than recovered
+     * here, because the owner of the transaction is the only one who can decide what a
+     * conflict means to it.
+     */
+    public Transfer transferWithin(
+            Configuration config,
+            AccountId from,
+            AccountId to,
+            Money amount,
+            String idempotencyKey) {
+
         Objects.requireNonNull(from, "from must not be null");
         Objects.requireNonNull(to, "to must not be null");
         Objects.requireNonNull(amount, "amount must not be null");
         TransferRules.requireKey(idempotencyKey);
 
-        try {
-            return dsl.transactionResult(config -> {
-                DSLContext transaction = DSL.using(config);
+        DSLContext transaction = DSL.using(config);
 
-                Optional<Transfer> alreadyDone = findByKey(transaction, idempotencyKey);
-                if (alreadyDone.isPresent()) {
-                    return alreadyDone.get().asReplay();
-                }
-
-                // Lock the paying account before its balance is read, so a concurrent
-                // transfer cannot spend the same money between the read and the write.
-                Account source = PostgresLedger.lockForSpending(config, from);
-                Account target = PostgresLedger.require(transaction, to);
-                Money available = PostgresLedger.balanceOf(transaction, source);
-                TransferRules.validate(source, target, amount, available);
-
-                return post(transaction, source, target, amount, idempotencyKey);
-            });
-        } catch (DataAccessException failure) {
-            if (!isUniqueViolation(failure)) {
-                throw failure;
-            }
-            // Lost the race on the key. The winner's transfer is the answer, and no
-            // second movement happened: this transaction rolled back in full.
-            return findByKey(dsl, idempotencyKey)
-                    .orElseThrow(() -> failure)
-                    .asReplay();
+        Optional<Transfer> alreadyDone = findByKey(transaction, idempotencyKey);
+        if (alreadyDone.isPresent()) {
+            return alreadyDone.get().asReplay();
         }
+
+        // Lock the paying account before its balance is read, so a concurrent transfer
+        // cannot spend the same money between the read and the write.
+        Account source = PostgresLedger.lockForSpending(config, from);
+        Account target = PostgresLedger.require(transaction, to);
+        Money available = PostgresLedger.balanceOf(transaction, source);
+        TransferRules.validate(source, target, amount, available);
+
+        return post(transaction, source, target, amount, idempotencyKey);
     }
 
     private Transfer post(
@@ -123,6 +143,15 @@ public class PostgresTransferService implements Transfers {
                 transferId, idempotencyKey, source.id(), target.id(), amount, at, false);
     }
 
+    /**
+     * The transfer recorded under this key, if this work has already been done. It comes
+     * back flagged as a replay, because finding one here means the caller is asking a
+     * second time.
+     */
+    public Optional<Transfer> findByKeyWithin(Configuration config, String idempotencyKey) {
+        return findByKey(DSL.using(config), idempotencyKey).map(Transfer::asReplay);
+    }
+
     private static Optional<Transfer> findByKey(DSLContext context, String idempotencyKey) {
         return context.selectFrom(TRANSFER)
                 .where(TRANSFER.IDEMPOTENCY_KEY.eq(idempotencyKey))
@@ -137,12 +166,4 @@ public class PostgresTransferService implements Transfers {
                         false));
     }
 
-    private static boolean isUniqueViolation(Throwable failure) {
-        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SQLException sql && UNIQUE_VIOLATION.equals(sql.getSQLState())) {
-                return true;
-            }
-        }
-        return false;
-    }
 }

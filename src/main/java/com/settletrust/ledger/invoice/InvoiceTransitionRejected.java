@@ -12,7 +12,12 @@ public class InvoiceTransitionRejected extends RuntimeException {
         ILLEGAL_TRANSITION,
         TERMINAL_STATE,
         /** The invoice moved between the caller reading it and trying to act on it. */
-        STATE_CHANGED
+        STATE_CHANGED,
+        /**
+         * The move is legal but money has to change hands with it, so it cannot be made
+         * by simply asserting the new status.
+         */
+        MONEY_MOVEMENT_REQUIRED
     }
 
     private final Reason reason;
