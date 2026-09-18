@@ -32,8 +32,9 @@ not a transfer.
 
 **Balances are projections, not columns.** An account holds no balance field. The balance
 is derived by summing the entries written against it, so there is no stored number that
-can quietly disagree with the log. This is O(n) today, which is the right trade in memory
-and a deliberate later decision once it is behind Postgres.
+can quietly disagree with the log. In Postgres that is an indexed `sum` over the account's
+entries, which is honest and correct but grows with history. A running balance or periodic
+snapshots is the next decision, and it is a deliberate one rather than a default.
 
 **Entries are append-only.** Nothing is updated or deleted. A correction is a new pair in
 the opposite direction, because an overwritten entry has destroyed the evidence of why a
