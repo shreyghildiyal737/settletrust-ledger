@@ -35,6 +35,15 @@ import java.util.Optional;
  */
 public class InvoiceSettlement {
 
+    /**
+     * Account naming, exposed because reconciliation has to recognise these accounts from
+     * their ids alone. An account id is the only thing a {@code chain:EURC} row carries to
+     * say what it is for, so the prefix is part of the schema, not a formatting detail.
+     */
+    public static final String ESCROW_ACCOUNT_PREFIX = "escrow:";
+    public static final String CHAIN_ACCOUNT_PREFIX = "chain:";
+    public static final String CHAIN_SHORTFALL_ACCOUNT_PREFIX = "chain-shortfall:";
+
     private final DSLContext dsl;
     private final PostgresLedger ledger;
     private final PostgresInvoices invoices;
@@ -64,7 +73,7 @@ public class InvoiceSettlement {
     }
 
     public static AccountId escrowAccountFor(String invoiceId) {
-        return AccountId.of("escrow:" + invoiceId);
+        return AccountId.of(ESCROW_ACCOUNT_PREFIX + invoiceId);
     }
 
     /**
@@ -73,7 +82,7 @@ public class InvoiceSettlement {
      * negative balance is exactly the total the platform is holding on chain.
      */
     public static AccountId chainAccountFor(String currency) {
-        return AccountId.of("chain:" + currency);
+        return AccountId.of(CHAIN_ACCOUNT_PREFIX + currency);
     }
 
     /**
@@ -84,7 +93,7 @@ public class InvoiceSettlement {
      * impossible to compute.
      */
     public static AccountId chainShortfallAccountFor(String currency) {
-        return AccountId.of("chain-shortfall:" + currency);
+        return AccountId.of(CHAIN_SHORTFALL_ACCOUNT_PREFIX + currency);
     }
 
     /**
@@ -101,7 +110,7 @@ public class InvoiceSettlement {
             int logIndex,
             Money amount) {
 
-        String key = "chain-deposit:" + txHash + ":" + logIndex;
+        String key = SettlementKeys.chainDeposit(txHash, logIndex);
         Optional<Settlement> alreadyDone =
                 alreadyDone(config, invoiceId, key, InvoiceStatus.ESCROW_FUNDED);
         if (alreadyDone.isPresent()) {
@@ -141,7 +150,7 @@ public class InvoiceSettlement {
             int logIndex,
             Money amount) {
 
-        String key = "chain-reversal:" + txHash + ":" + logIndex;
+        String key = SettlementKeys.chainReversal(txHash, logIndex);
         AccountId escrow = escrowAccountFor(invoiceId);
         AccountId chain = chainAccountFor(amount.currency());
 
@@ -183,7 +192,7 @@ public class InvoiceSettlement {
     public Settlement fundEscrow(String invoiceId, AccountId buyerAccount) {
         Objects.requireNonNull(buyerAccount, "buyerAccount must not be null");
 
-        String key = "escrow-fund:" + invoiceId;
+        String key = SettlementKeys.escrowFund(invoiceId);
 
         return run(invoiceId, config -> {
             InvoiceState state = requireInvoice(config, invoiceId);
@@ -219,7 +228,7 @@ public class InvoiceSettlement {
     public Settlement settle(String invoiceId, AccountId sellerAccount) {
         Objects.requireNonNull(sellerAccount, "sellerAccount must not be null");
 
-        String key = "invoice-settle:" + invoiceId;
+        String key = SettlementKeys.invoiceSettle(invoiceId);
 
         return run(invoiceId, config -> {
             InvoiceState state = requireInvoice(config, invoiceId);

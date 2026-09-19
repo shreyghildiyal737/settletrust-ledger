@@ -4,6 +4,8 @@ import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
 import com.settletrust.ledger.invoice.PostgresInvoices;
+import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
+import com.settletrust.ledger.reconciliation.Reconciler;
 import com.settletrust.ledger.settlement.InvoiceSettlement;
 import org.jooq.DSLContext;
 import org.jooq.SQLDialect;
@@ -11,6 +13,7 @@ import org.jooq.impl.DSL;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.context.annotation.Bean;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import javax.sql.DataSource;
 import java.time.Clock;
@@ -25,6 +28,7 @@ import java.time.Clock;
  * the part it is genuinely good at.
  */
 @SpringBootApplication
+@EnableScheduling
 public class LedgerApplication {
 
     public static void main(String[] args) {
@@ -60,6 +64,16 @@ public class LedgerApplication {
     @Bean
     PostgresInvoices invoices(DSLContext dsl, Clock clock) {
         return new PostgresInvoices(dsl, clock);
+    }
+
+    @Bean
+    PostgresReconciliationRuns reconciliationRuns(DSLContext dsl) {
+        return new PostgresReconciliationRuns(dsl);
+    }
+
+    @Bean
+    Reconciler reconciler(DSLContext dsl, Clock clock, PostgresReconciliationRuns runs) {
+        return new Reconciler(dsl, clock, runs);
     }
 
     @Bean

@@ -32,7 +32,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * new transfer a 201, that a refusal carries a reason a client can branch on, and that
  * each refusal lands on the status code it deserves.
  */
-@SpringBootTest
+// The scheduled reconciler is off here. These tests share a database with every other
+// test class, so a background run would reconcile half-built fixtures and report on them.
+@SpringBootTest(properties = "ledger.reconciliation.enabled=false")
 @AutoConfigureMockMvc
 class LedgerApiTest {
 

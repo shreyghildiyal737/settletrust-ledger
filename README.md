@@ -145,7 +145,7 @@ second payment. The transfer's idempotency key is the evidence that the work was
 The second way money arrives. An escrow can be funded from a bank account through the API,
 or on chain by a buyer paying a Solidity contract, and **both land in the same ledger**.
 That is the whole design: one ledger, two rails, and a reconciliation that can compare
-them because they are written in the same entries.
+them because they are written in the same entries. Reconciliation is below.
 
 `contracts/InvoiceEscrow.sol` holds a stablecoin payment per invoice and emits an event
 carrying the invoice id. It deliberately does not model the lifecycle: that already exists
@@ -189,6 +189,50 @@ that reorganises on demand, which is the one thing a real testnet will not do wh
 The contract is written but **not deployed and not yet exercised against a node**. The
 remaining work is a `ChainSource` backed by a real client and a run against a local chain.
 
+## Reconciliation
+
+The two rails are written by the same code in the same transactions, so in theory they
+cannot disagree. Reconciliation exists because "in theory" is the part that fails. A bug,
+a manual correction, a half-applied migration or a restore from a backup taken mid-flight
+all produce books that are internally consistent and wrong, and none of them go through
+the code that would have prevented them.
+
+So every check derives its answer from stored rows rather than from anything the service
+remembers, and the checks run in both directions. Asking only "was every confirmed deposit
+credited" finds money owed to customers and misses money credited that nobody ever sent,
+which is the more expensive of the two.
+
+| Check | What it would catch |
+|---|---|
+| Every entry in a currency nets to zero | Any single-sided write, whatever produced it |
+| Every transfer is a pair of entries netting zero | Two faults that cancel out across the book |
+| Every confirmed deposit has its transfer, for the right amount, into the right escrow | A credit lost, duplicated or misdirected |
+| Every reversed deposit has both the credit and the reversal | Money the chain took back and the ledger still holds |
+| Every `chain-deposit:` transfer has a confirmed deposit behind it | Money credited that the chain never sent |
+| `chain:<currency>` equals the negative of what the chain confirmed | Anything that touched the chain account outside the watcher |
+| No customer account is negative | A row lock that did not serialise what it was supposed to |
+
+The last one is the aggregate check, and it is deliberately computed from the opposite end
+of the data to the per-deposit ones. When both fire on the same fault they corroborate
+each other; when only the aggregate fires, something reached the chain account by a route
+the per-deposit checks do not look at.
+
+**Nothing here repairs anything.** A reconciler that silently corrects what it finds
+destroys the evidence of how the books came to be wrong, and the second occurrence then
+looks like the first.
+
+Runs are stored, findings and all, in `reconciliation_run` and `reconciliation_finding`,
+both append-only like everything else that is a record of what happened. The counts are
+stored with the verdict on purpose: "no discrepancies" means nothing on its own, because a
+run that checked nothing because the watcher had silently stopped reports exactly the same
+thing as a healthy one.
+
+A fixed delay drives it, not a fixed rate, so a slow pass on a large book cannot queue
+runs behind itself. There is one honest limitation: two instances against one database
+would both reconcile and both write a report of the same facts. That is wasteful rather
+than dangerous, since reconciliation only reads the ledger, and the fix is a lease this
+does not have yet.
+
 ## The API
 
 Spring Boot, and only at the edge. No class in the domain carries a Spring annotation, so
@@ -208,6 +252,8 @@ at.
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
 | `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
+| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body. |
+| `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
 
 ```http
 POST /api/v1/transfers
@@ -244,11 +290,17 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-129 tests, all green: the domain rules in microseconds with no database, the storage layer
+140 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
 thread per task, so they genuinely contend.
+
+Most test classes isolate themselves by generating their own account ids and leaving
+everyone else's rows alone. The reconciliation tests cannot: a finding is a statement
+about the whole database, so a leftover from another class would be part of the answer.
+Each of those gets a freshly migrated schema of its own, which is what lets them assert
+not "at least one finding" but "this finding, and nothing else wrong".
 
 | What is proved | Where |
 |---|---|
@@ -285,6 +337,15 @@ thread per task, so they genuinely contend.
 | A buyer who cannot pay leaves the invoice exactly where it was | same |
 | Settling or funding twice returns the first result and pays once | same |
 | An invoice cannot be settled before delivery is confirmed | same |
+| A credited deposit, and a reversed one, both reconcile clean | `ReconcilerTest` |
+| A confirmed deposit with no transfer behind it is caught | same |
+| A deposit marked reversed with nothing reversing it is caught twice over | same |
+| Money credited under a deposit key the chain never sent is caught | same |
+| An entry added behind the service's back unbalances its transfer and its book | same |
+| A customer account driven negative by a write that skipped the rules is caught | same |
+| Money leaving the chain account by any other route breaks the aggregate check | same |
+| A run and its findings are stored, and read back as they were found | same |
+| A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 
 ```bash
 mvn test
@@ -305,13 +366,14 @@ mvn test
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
 generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
-settlement, the on-chain deposit rail with its reorg handling, and the tests above. The
-escrow contract is written but not yet deployed or run against a node.
+settlement, the on-chain deposit rail with its reorg handling, reconciliation and its
+schedule, and the tests above. The escrow contract is written but not yet deployed or run
+against a node.
 
 **Next, in order:**
 
 1. A `ChainSource` backed by a real Ethereum client, and the contract deployed to a local
    chain so the rail is exercised end to end rather than against a fake.
-2. Reconciliation as a scheduled job, proving the two rails agree.
+2. A lease on the reconciliation schedule, so more than one instance can run safely.
 
 One ledger, two settlement rails.

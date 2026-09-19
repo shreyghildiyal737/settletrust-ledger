@@ -13,10 +13,13 @@ import java.util.Optional;
  * not produce when asked: a block being taken back, a transaction reappearing at a
  * different height, an event arriving twice. Here a reorganisation is one method call.
  *
+ * <p>Public rather than package-private because the reconciliation tests drive it too:
+ * proving the two rails agree after a reorganisation needs a chain that will reorganise.
+ *
  * <p>Block numbers are positions in the list, so rolling back and mining again produces
  * exactly what a reorganisation produces: the same height, a different block.
  */
-final class FakeChain implements ChainSource {
+public final class FakeChain implements ChainSource {
 
     private record Block(String hash, List<ChainDeposit> deposits) {
     }
@@ -24,7 +27,7 @@ final class FakeChain implements ChainSource {
     private final List<Block> blocks = new ArrayList<>();
     private int minted;
 
-    FakeChain() {
+    public FakeChain() {
         mineEmpty(1);
     }
 
@@ -51,14 +54,14 @@ final class FakeChain implements ChainSource {
     }
 
     /** Mines {@code count} blocks containing nothing, to bury what came before them. */
-    void mineEmpty(int count) {
+    public void mineEmpty(int count) {
         for (int i = 0; i < count; i++) {
             blocks.add(new Block(nextHash(), new ArrayList<>()));
         }
     }
 
     /** Mines one block containing a single deposit, and returns it as the chain reports it. */
-    ChainDeposit mineDeposit(String txHash, String invoiceId, Money amount) {
+    public ChainDeposit mineDeposit(String txHash, String invoiceId, Money amount) {
         String blockHash = nextHash();
         long number = blocks.size();
         ChainDeposit deposit = new ChainDeposit(txHash, 0, number, blockHash, invoiceId, amount);
@@ -70,7 +73,7 @@ final class FakeChain implements ChainSource {
      * Discards every block above {@code blockNumber}, as a reorganisation does. Whatever
      * was in them is gone until something mines it again.
      */
-    void rollBackTo(long blockNumber) {
+    public void rollBackTo(long blockNumber) {
         while (blocks.size() - 1 > blockNumber) {
             blocks.remove(blocks.size() - 1);
         }

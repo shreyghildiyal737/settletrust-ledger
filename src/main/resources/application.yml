@@ -16,6 +16,16 @@ spring:
     enabled: true
     locations: classpath:db/migration
 
+ledger:
+  reconciliation:
+    # Off only for tests that share a database with other tests, where a background run
+    # would reconcile somebody else's half-built fixtures.
+    enabled: ${LEDGER_RECONCILIATION_ENABLED:true}
+    # Long enough that a run is never queued behind the last one, short enough that a
+    # discrepancy is found in the same shift it was created.
+    interval: ${LEDGER_RECONCILIATION_INTERVAL:PT15M}
+    initial-delay: ${LEDGER_RECONCILIATION_INITIAL_DELAY:PT1M}
+
 server:
   port: ${PORT:8080}
   error:
