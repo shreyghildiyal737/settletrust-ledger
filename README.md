@@ -270,10 +270,19 @@ means nothing on its own, because a run that checked nothing because the watcher
 silently stopped reports exactly the same thing as a healthy one.
 
 A fixed delay drives it, not a fixed rate, so a slow pass on a large book cannot queue
-runs behind itself. There is one honest limitation: two instances against one database
-would both reconcile and both write a report of the same facts. That is wasteful rather
-than dangerous, since reconciliation only reads the ledger, and the fix is a lease this
-does not have yet.
+runs behind itself.
+
+**Several instances can run it.** Each takes a lease before it starts, so one does the
+work and the others find it taken and go back to sleep. The lease is a Postgres advisory
+lock scoped to the run's transaction, chosen over a row or a Redis key because it needs
+no cleanup and cannot go stale: an instance that dies mid-run loses its connection,
+Postgres ends the transaction, and the lock goes with it. A lease held in a table needs
+an expiry, and choosing one means guessing how long a run takes on a book you have not
+seen yet.
+
+It is tried without waiting rather than blocked on. The runs are on a timer, so the next
+one is minutes away, and a queue of instances waiting on a lock is a queue of open
+snapshots holding vacuum back.
 
 ## The API
 
@@ -294,7 +303,7 @@ at.
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
 | `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
-| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `reservesChecked` saying whether the chain was asked. |
+| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `reservesChecked` saying whether the chain was asked. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
 
 ```http
@@ -332,7 +341,7 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-146 tests, all green: the domain rules in microseconds with no database, the storage layer
+147 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -393,6 +402,7 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A deposit still awaiting confirmations explains a surplus rather than raising one | same |
 | Money in the contract that nothing explains is raised as a question | same |
 | With no chain to ask, the report says so rather than reading as verified | same |
+| A second instance finds the lease taken and writes no duplicate report | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 
 ```bash
@@ -424,8 +434,7 @@ every report this service produces today says `reservesChecked: false`, and mean
 1. A `ChainSource` and an `EscrowReserves` backed by a real Ethereum client, with the
    contract deployed to a local chain. One piece of work now, since the reserve check is
    the thing that most needs a real node and the port it needs is already there.
-2. A lease on the reconciliation schedule, so more than one instance can run safely.
-3. Reconciliation from a watermark with a periodic full sweep, so the snapshot is not held
+2. Reconciliation from a watermark with a periodic full sweep, so the snapshot is not held
    open across the whole book.
 
 One ledger, two settlement rails.

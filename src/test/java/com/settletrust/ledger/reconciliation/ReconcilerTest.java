@@ -124,7 +124,7 @@ class ReconcilerTest {
     void theHappyPathAgrees() {
         confirmTheDeposit();
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertTrue(report.agreed(), () -> "unexpected: " + report.discrepancies()),
@@ -143,7 +143,7 @@ class ReconcilerTest {
         chain.mineEmpty(CONFIRMATIONS + 1);
         watcher.poll(chain);
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(ObservationStatus.REVERSED,
@@ -157,7 +157,7 @@ class ReconcilerTest {
     void aConfirmedDepositThatNeverMovedMoney() {
         recordObservationDirectly(ObservationStatus.CONFIRMED);
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.discrepancies().size(),
@@ -181,7 +181,7 @@ class ReconcilerTest {
         // a partial replay or a hand-edited row, which is what reconciliation is for.
         markObservationReversedWithoutReversingIt();
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         // Two findings, and the second one is the point: the per-deposit check and the
         // aggregate check reach the same conclusion from opposite ends of the data. The
@@ -204,7 +204,7 @@ class ReconcilerTest {
         transfers.transfer(
                 source, destination, AMOUNT, SettlementKeys.chainDeposit("0xnever" + run, 0));
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.discrepancies().size(),
@@ -230,7 +230,7 @@ class ReconcilerTest {
                 .set(ENTRY.RECORDED_AT, LocalDateTime.now(ZoneOffset.UTC))
                 .execute();
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.of(DiscrepancyKind.TRANSFER_NOT_BALANCED).size(),
@@ -252,7 +252,7 @@ class ReconcilerTest {
         // customer is holding less than nothing. No check on totals alone would see it.
         postPairDirectly(customer, house, Money.of(500L, "EURC"));
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.discrepancies().size(),
@@ -278,7 +278,7 @@ class ReconcilerTest {
                 InvoiceSettlement.chainAccountFor("EURC"), sink,
                 Money.of(1_000L, "EURC"), "manual-correction-" + run);
 
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         List<Discrepancy> found = report.of(DiscrepancyKind.CHAIN_ACCOUNT_DISAGREES);
         assertAll(
@@ -295,7 +295,7 @@ class ReconcilerTest {
     @DisplayName("the run and its findings are stored, and read back as they were found")
     void theReportIsEvidenceAfterTheFact() {
         recordObservationDirectly(ObservationStatus.CONFIRMED);
-        ReconciliationReport asRun = reconciler.run();
+        ReconciliationReport asRun = reconciler.run().orElseThrow();
 
         ReconciliationReport asStored = runs.latest().orElseThrow();
 
@@ -311,7 +311,7 @@ class ReconcilerTest {
     @DisplayName("a clean run is worth storing too")
     void aCleanRunIsStored() {
         confirmTheDeposit();
-        reconciler.run();
+        reconciler.run().orElseThrow();
 
         ReconciliationReport stored = runs.latest().orElseThrow();
 
@@ -356,7 +356,7 @@ class ReconcilerTest {
                     }));
 
             ReconciliationReport underTheRace =
-                    new Reconciler(DSL.using(racy), Clock.systemUTC(), runs).run();
+                    new Reconciler(DSL.using(racy), Clock.systemUTC(), runs).run().orElseThrow();
 
             assertAll(
                     () -> assertTrue(raced.get(),
@@ -365,7 +365,7 @@ class ReconcilerTest {
                             () -> "unexpected: " + underTheRace.discrepancies()),
                     () -> assertEquals(1, underTheRace.observationsChecked(),
                             "the run answered for the book as it stood when it started"),
-                    () -> assertEquals(2, reconciler.run().observationsChecked(),
+                    () -> assertEquals(2, reconciler.run().orElseThrow().observationsChecked(),
                             "and the deposit that raced it really had committed"));
         }
     }
@@ -375,7 +375,7 @@ class ReconcilerTest {
     void theChainBacksWhatWasCredited() {
         confirmTheDeposit();
 
-        ReconciliationReport report = reconcilerAskingTheChain.run();
+        ReconciliationReport report = reconcilerAskingTheChain.run().orElseThrow();
 
         assertAll(
                 () -> assertTrue(report.agreed(), () -> "unexpected: " + report.discrepancies()),
@@ -393,7 +393,7 @@ class ReconcilerTest {
         // because the watcher wrote both sides of what they compare.
         chain.adjustHeldOnChain(Money.of(-1_000L, "EURC"));
 
-        ReconciliationReport report = reconcilerAskingTheChain.run();
+        ReconciliationReport report = reconcilerAskingTheChain.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.discrepancies().size(),
@@ -418,7 +418,7 @@ class ReconcilerTest {
         chain.mineDeposit("0xtx2" + run, secondInvoice, AMOUNT);
         watcher.poll(chain);
 
-        ReconciliationReport report = reconcilerAskingTheChain.run();
+        ReconciliationReport report = reconcilerAskingTheChain.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(ObservationStatus.PENDING,
@@ -435,7 +435,7 @@ class ReconcilerTest {
         // event. The second is a failure no other check in here can see.
         chain.adjustHeldOnChain(Money.of(5_000L, "EURC"));
 
-        ReconciliationReport report = reconcilerAskingTheChain.run();
+        ReconciliationReport report = reconcilerAskingTheChain.run().orElseThrow();
 
         assertAll(
                 () -> assertEquals(1, report.discrepancies().size(),
@@ -455,13 +455,41 @@ class ReconcilerTest {
         // The same shortfall the previous test catches. This reconciler has no chain, so
         // it cannot see it, and the only thing standing between that and a report an
         // operator would read as proof is the flag.
-        ReconciliationReport report = reconciler.run();
+        ReconciliationReport report = reconciler.run().orElseThrow();
 
         assertAll(
                 () -> assertTrue(report.agreed(),
                         "it genuinely agrees on everything it is able to look at"),
                 () -> assertFalse(report.reservesChecked(),
                         "and the report has to admit what it did not look at"));
+    }
+
+    @Test
+    @DisplayName("a second instance finds the lease taken and does not scan the book again")
+    void onlyOneInstanceReconcilesAtATime() {
+        confirmTheDeposit();
+
+        try (Database other = new Database(target.url(), target.username(), target.password())) {
+            Reconciler otherInstance =
+                    new Reconciler(other.dsl(), Clock.systemUTC(),
+                            new PostgresReconciliationRuns(other.dsl()));
+
+            // Hold the lease the way a run in progress holds it, on a connection of its
+            // own, and ask a second instance to reconcile underneath it.
+            dsl.transaction(config -> {
+                DSL.using(config).execute(
+                        "select pg_advisory_xact_lock(?)", Reconciler.LEASE_KEY);
+
+                assertTrue(otherInstance.run().isEmpty(),
+                        "the second instance should have found the lease taken");
+            });
+
+            assertAll(
+                    () -> assertTrue(runs.latest().isEmpty(),
+                            "and written no report, rather than a duplicate of somebody else's"),
+                    () -> assertTrue(otherInstance.run().isPresent(),
+                            "once the lease is free it reconciles normally"));
+        }
     }
 
     private void confirmTheDeposit() {

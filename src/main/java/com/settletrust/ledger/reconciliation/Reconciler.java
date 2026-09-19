@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
@@ -47,6 +48,15 @@ import static com.settletrust.ledger.jooq.Tables.TRANSFER;
  * looks like the first.
  */
 public class Reconciler {
+
+    /**
+     * The lease, as a Postgres advisory lock key.
+     *
+     * <p>An arbitrary but fixed number. Advisory locks share one namespace per database
+     * rather than per schema, so this must not collide with a key any other part of the
+     * system picks, and it is written here where that can be checked.
+     */
+    static final long LEASE_KEY = 6_251_968_311_047_201L;
 
     private final DSLContext dsl;
     private final Clock clock;
@@ -92,13 +102,28 @@ public class Reconciler {
      * <p>The cost is an open snapshot for the length of the run, which holds back vacuum
      * on a large book. That is one of the reasons the next version of this reconciles
      * from a watermark rather than scanning everything.
+     *
+     * <p><b>Empty means somebody else is already reconciling.</b> Two instances against
+     * one database would otherwise both scan the book and both write a report of the same
+     * facts, which is wasteful rather than dangerous, and clutters the record an operator
+     * has to read during an incident with duplicates of itself.
+     *
+     * <p>The lease is a Postgres advisory lock scoped to this transaction, chosen over a
+     * row or a Redis key because it needs no cleanup and cannot go stale. An instance
+     * that dies mid-run loses its connection, Postgres ends the transaction, and the lock
+     * is gone with it. A lease held in a table has to be given an expiry, and choosing
+     * that expiry means guessing how long a run takes on a book you have not seen yet.
      */
-    public ReconciliationReport run() {
+    public Optional<ReconciliationReport> run() {
         return dsl.transactionResult(config -> {
             DSLContext snapshot = DSL.using(config);
             // Must be the first statement in the transaction, and it is: jOOQ has issued
             // no SQL yet, and Postgres takes the snapshot itself at the first query below.
             snapshot.execute("set transaction isolation level repeatable read");
+
+            if (!leaseTaken(snapshot)) {
+                return Optional.<ReconciliationReport>empty();
+            }
 
             List<Discrepancy> found = new ArrayList<>();
 
@@ -127,8 +152,19 @@ public class Reconciler {
             // Written inside the same transaction, so the report lands with the snapshot
             // it describes rather than alongside a database that has moved on.
             runs.recordWithin(config, report);
-            return report;
+            return Optional.of(report);
         });
+    }
+
+    /**
+     * Tries for the lease without waiting. Waiting would be worse than skipping: the
+     * runs are on a timer, so the next one is minutes away, and a queue of instances
+     * blocked on a lock is a queue of open snapshots holding back vacuum.
+     */
+    private static boolean leaseTaken(DSLContext snapshot) {
+        return Boolean.TRUE.equals(snapshot
+                .select(DSL.field("pg_try_advisory_xact_lock(?)", Boolean.class, LEASE_KEY))
+                .fetchOne(0, Boolean.class));
     }
 
     /**

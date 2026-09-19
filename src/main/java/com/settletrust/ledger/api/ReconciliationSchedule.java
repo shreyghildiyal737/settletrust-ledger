@@ -9,17 +9,17 @@ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
+import java.util.Optional;
+
 /**
  * Runs the reconciler on a timer.
  *
  * <p>A fixed delay rather than a fixed rate: the next run starts a set time after the
  * last one finished, so a slow pass on a large book cannot queue runs behind itself.
  *
- * <p>There is exactly one of these per deployment, which is a real constraint: two
- * instances on the same database would both reconcile and both write a report of the
- * same facts. That is wasteful rather than dangerous, since reconciliation only reads the
- * ledger, and it is called out here because the fix is a lease and this does not have one
- * yet.
+ * <p>Several instances may run this safely. The reconciler takes a lease before it
+ * starts, so exactly one of them does the work and the others find it taken and go back
+ * to sleep until their next tick.
  */
 @Component
 @ConditionalOnProperty(
@@ -38,9 +38,9 @@ class ReconciliationSchedule {
             initialDelayString = "${ledger.reconciliation.initial-delay:PT1M}",
             fixedDelayString = "${ledger.reconciliation.interval:PT15M}")
     void reconcile() {
-        ReconciliationReport report;
+        Optional<ReconciliationReport> completed;
         try {
-            report = reconciler.run();
+            completed = reconciler.run();
         } catch (RuntimeException failure) {
             // Swallowed deliberately: the scheduler cancels a task that throws, and a
             // reconciler that quietly stops after one bad night is worse than no
@@ -49,9 +49,18 @@ class ReconciliationSchedule {
             return;
         }
 
+        if (completed.isEmpty()) {
+            // Expected on every instance but one, so it is not a warning.
+            log.info("Another instance holds the reconciliation lease, skipping this tick");
+            return;
+        }
+
+        ReconciliationReport report = completed.get();
         if (report.agreed()) {
-            log.info("Reconciliation {} clean: {} deposits and {} transfers checked",
-                    report.runId(), report.observationsChecked(), report.transfersChecked());
+            log.info("Reconciliation {} clean: {} deposits and {} transfers checked, "
+                            + "reserves {}",
+                    report.runId(), report.observationsChecked(), report.transfersChecked(),
+                    report.reservesChecked() ? "verified against the chain" : "NOT checked");
             return;
         }
 
