@@ -55,29 +55,58 @@ public class Reconciler {
         this.runs = Objects.requireNonNull(runs, "runs must not be null");
     }
 
-    /** Runs every check, records the report, and returns it. */
+    /**
+     * Runs every check against one snapshot of the database, records the report, and
+     * returns it.
+     *
+     * <p>The isolation level is the whole reason this is a transaction, since nothing
+     * here depends on the ledger for its own writes. Under {@code read committed} each
+     * statement takes a fresh snapshot, so a settlement committing between two of these
+     * checks would be counted by one and not the other, and the reconciler would report a
+     * discrepancy that never existed. A job that cries wolf every few runs is worse than
+     * no job at all, because it teaches an operator to close the alert without reading
+     * it. {@code repeatable read} gives every statement the same snapshot and the
+     * false positive cannot arise.
+     *
+     * <p>Not {@code serializable}: that buys protection against write skew, and this
+     * writes nothing the checks read. It would only add predicate locking and
+     * serialisation failures to a read-only pass.
+     *
+     * <p>The cost is an open snapshot for the length of the run, which holds back vacuum
+     * on a large book. That is one of the reasons the next version of this reconciles
+     * from a watermark rather than scanning everything.
+     */
     public ReconciliationReport run() {
-        List<Discrepancy> found = new ArrayList<>();
+        return dsl.transactionResult(config -> {
+            DSLContext snapshot = DSL.using(config);
+            // Must be the first statement in the transaction, and it is: jOOQ has issued
+            // no SQL yet, and Postgres takes the snapshot itself at the first query below.
+            snapshot.execute("set transaction isolation level repeatable read");
 
-        found.addAll(currenciesThatDoNotNetToZero());
-        found.addAll(transfersThatAreNotBalancedPairs());
+            List<Discrepancy> found = new ArrayList<>();
 
-        Deposits deposits = depositsAgainstTheLedger();
-        found.addAll(deposits.discrepancies());
+            found.addAll(currenciesThatDoNotNetToZero(snapshot));
+            found.addAll(transfersThatAreNotBalancedPairs(snapshot));
 
-        found.addAll(creditsWithNoConfirmedDepositBehindThem());
-        found.addAll(chainAccountsAgainstWhatTheChainSent());
-        found.addAll(overdrawnCustomerAccounts());
+            Deposits deposits = depositsAgainstTheLedger(snapshot);
+            found.addAll(deposits.discrepancies());
 
-        ReconciliationReport report = new ReconciliationReport(
-                UUID.randomUUID(),
-                clock.instant(),
-                deposits.checked(),
-                countOfTransfers(),
-                found);
+            found.addAll(creditsWithNoConfirmedDepositBehindThem(snapshot));
+            found.addAll(chainAccountsAgainstWhatTheChainSent(snapshot));
+            found.addAll(overdrawnCustomerAccounts(snapshot));
 
-        runs.record(report);
-        return report;
+            ReconciliationReport report = new ReconciliationReport(
+                    UUID.randomUUID(),
+                    clock.instant(),
+                    deposits.checked(),
+                    countOfTransfers(snapshot),
+                    found);
+
+            // Written inside the same transaction, so the report lands with the snapshot
+            // it describes rather than alongside a database that has moved on.
+            runs.recordWithin(config, report);
+            return report;
+        });
     }
 
     /**
@@ -86,10 +115,10 @@ public class Reconciler {
      * <p>It is cheap and it subsumes a great deal. Any single-sided write, any half-posted
      * transfer and any entry inserted by hand shows up here, whatever produced it.
      */
-    private List<Discrepancy> currenciesThatDoNotNetToZero() {
+    private List<Discrepancy> currenciesThatDoNotNetToZero(DSLContext snapshot) {
         Field<BigDecimal> net = DSL.sum(ENTRY.AMOUNT_MINOR);
 
-        return dsl.select(ENTRY.CURRENCY, net)
+        return snapshot.select(ENTRY.CURRENCY, net)
                 .from(ENTRY)
                 .groupBy(ENTRY.CURRENCY)
                 .having(net.ne(BigDecimal.ZERO))
@@ -114,11 +143,11 @@ public class Reconciler {
      * the sum, because three entries netting to zero is a transfer this service has no
      * way of having written.
      */
-    private List<Discrepancy> transfersThatAreNotBalancedPairs() {
+    private List<Discrepancy> transfersThatAreNotBalancedPairs(DSLContext snapshot) {
         Field<BigDecimal> net = DSL.sum(ENTRY.AMOUNT_MINOR);
         Field<Integer> lines = DSL.count();
 
-        return dsl.select(ENTRY.TRANSFER_ID, net, lines)
+        return snapshot.select(ENTRY.TRANSFER_ID, net, lines)
                 .from(ENTRY)
                 .groupBy(ENTRY.TRANSFER_ID)
                 .having(net.ne(BigDecimal.ZERO).or(lines.ne(2)))
@@ -143,11 +172,11 @@ public class Reconciler {
      * both the credit that happened and the reversal that undid it, and a reversal
      * standing alone means the ledger is holding money the chain took back.
      */
-    private Deposits depositsAgainstTheLedger() {
+    private Deposits depositsAgainstTheLedger(DSLContext snapshot) {
         com.settletrust.ledger.jooq.tables.Transfer credit = TRANSFER.as("credit");
         com.settletrust.ledger.jooq.tables.Transfer reversal = TRANSFER.as("reversal");
 
-        Result<Record> rows = dsl.select()
+        Result<Record> rows = snapshot.select()
                 .from(CHAIN_OBSERVATION)
                 .leftJoin(credit)
                 .on(credit.IDEMPOTENCY_KEY.eq(keyFor(SettlementKeys.CHAIN_DEPOSIT_PREFIX)))
@@ -250,8 +279,8 @@ public class Reconciler {
      * are ones the watcher has seen and deliberately not acted on, so a transfer carrying
      * their key means something moved money the watcher had decided not to trust yet.
      */
-    private List<Discrepancy> creditsWithNoConfirmedDepositBehindThem() {
-        return dsl.select(TRANSFER.IDEMPOTENCY_KEY, TRANSFER.AMOUNT_MINOR, TRANSFER.CURRENCY,
+    private List<Discrepancy> creditsWithNoConfirmedDepositBehindThem(DSLContext snapshot) {
+        return snapshot.select(TRANSFER.IDEMPOTENCY_KEY, TRANSFER.AMOUNT_MINOR, TRANSFER.CURRENCY,
                         CHAIN_OBSERVATION.STATUS)
                 .from(TRANSFER)
                 .leftJoin(CHAIN_OBSERVATION)
@@ -288,10 +317,10 @@ public class Reconciler {
      * out, since the reversal pays back into the same account, so only confirmed ones
      * count.
      */
-    private List<Discrepancy> chainAccountsAgainstWhatTheChainSent() {
+    private List<Discrepancy> chainAccountsAgainstWhatTheChainSent(DSLContext snapshot) {
         Map<String, Long> confirmedByCurrency = new HashMap<>();
         Field<BigDecimal> deposited = DSL.sum(CHAIN_OBSERVATION.AMOUNT_MINOR);
-        dsl.select(CHAIN_OBSERVATION.CURRENCY, deposited)
+        snapshot.select(CHAIN_OBSERVATION.CURRENCY, deposited)
                 .from(CHAIN_OBSERVATION)
                 .where(CHAIN_OBSERVATION.STATUS.eq(ObservationStatus.CONFIRMED.name()))
                 .groupBy(CHAIN_OBSERVATION.CURRENCY)
@@ -301,7 +330,7 @@ public class Reconciler {
 
         Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
 
-        return dsl.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
+        return snapshot.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
                 .from(ACCOUNT)
                 .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
                 .where(ACCOUNT.ID.startsWith(InvoiceSettlement.CHAIN_ACCOUNT_PREFIX))
@@ -337,10 +366,10 @@ public class Reconciler {
      * serialise its spending did not, and no amount of re-reading the transfer code will
      * show that.
      */
-    private List<Discrepancy> overdrawnCustomerAccounts() {
+    private List<Discrepancy> overdrawnCustomerAccounts(DSLContext snapshot) {
         Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
 
-        return dsl.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
+        return snapshot.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
                 .from(ACCOUNT)
                 .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
                 .where(ACCOUNT.KIND.eq("CUSTOMER"))
@@ -359,8 +388,8 @@ public class Reconciler {
                 });
     }
 
-    private int countOfTransfers() {
-        return dsl.fetchCount(TRANSFER);
+    private static int countOfTransfers(DSLContext snapshot) {
+        return snapshot.fetchCount(TRANSFER);
     }
 
     /**

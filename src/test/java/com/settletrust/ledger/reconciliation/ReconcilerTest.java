@@ -16,7 +16,12 @@ import com.settletrust.ledger.invoice.InvoiceStatus;
 import com.settletrust.ledger.invoice.PostgresInvoices;
 import com.settletrust.ledger.settlement.InvoiceSettlement;
 import com.settletrust.ledger.settlement.SettlementKeys;
+import org.jooq.Configuration;
 import org.jooq.DSLContext;
+import org.jooq.ExecuteContext;
+import org.jooq.ExecuteListener;
+import org.jooq.impl.DSL;
+import org.jooq.impl.DefaultExecuteListenerProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -27,6 +32,7 @@ import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.settletrust.ledger.jooq.Tables.ENTRY;
 import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
@@ -94,11 +100,7 @@ class ReconcilerTest {
         invoiceId = "inv-" + run;
         txHash = "0xtx" + run;
 
-        invoices.open(new Invoice(
-                invoiceId, "PO-" + run, "seller-" + run, "buyer-" + run, AMOUNT, clock.instant()));
-        invoices.transition(invoiceId, InvoiceStatus.SUBMITTED, null, null);
-        invoices.transition(invoiceId, InvoiceStatus.BUYER_ACCEPTED, null, null);
-        invoices.transition(invoiceId, InvoiceStatus.ESCROW_PENDING, null, null);
+        openInvoiceAwaitingItsEscrow(invoiceId);
     }
 
     @AfterEach
@@ -313,10 +315,80 @@ class ReconcilerTest {
                         "the counts are what make a clean verdict mean anything"));
     }
 
+    @Test
+    @DisplayName("a settlement committing mid-run cannot make the reconciler cry wolf")
+    void theWholeRunSeesOneSnapshot() {
+        confirmTheDeposit();
+
+        String secondInvoice = "inv2-" + run;
+        openInvoiceAwaitingItsEscrow(secondInvoice);
+        chain.mineDeposit("0xtx2" + run, secondInvoice, AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+
+        try (Database other = new Database(target.url(), target.username(), target.password())) {
+            EscrowWatcher concurrent = watcherOn(other);
+            AtomicBoolean raced = new AtomicBoolean();
+
+            // The second deposit is committed from another connection at the worst moment
+            // there is: after the reconciler has summed what the chain confirmed and
+            // before it reads the chain account those deposits are supposed to match.
+            // Under read committed those two statements would straddle the commit, and
+            // the run would report a chain account short by exactly one deposit that had
+            // in fact been credited correctly.
+            Configuration racy = dsl.configuration().derive(new DefaultExecuteListenerProvider(
+                    new ExecuteListener() {
+                        @Override
+                        public void end(ExecuteContext ctx) {
+                            String sql = ctx.sql();
+                            if (sql != null
+                                    && sql.contains("sum(")
+                                    && sql.contains("chain_observation")
+                                    && raced.compareAndSet(false, true)) {
+                                concurrent.poll(chain);
+                            }
+                        }
+                    }));
+
+            ReconciliationReport underTheRace =
+                    new Reconciler(DSL.using(racy), Clock.systemUTC(), runs).run();
+
+            assertAll(
+                    () -> assertTrue(raced.get(),
+                            "nothing was committed mid-run, so this test proved nothing"),
+                    () -> assertTrue(underTheRace.agreed(),
+                            () -> "unexpected: " + underTheRace.discrepancies()),
+                    () -> assertEquals(1, underTheRace.observationsChecked(),
+                            "the run answered for the book as it stood when it started"),
+                    () -> assertEquals(2, reconciler.run().observationsChecked(),
+                            "and the deposit that raced it really had committed"));
+        }
+    }
+
     private void confirmTheDeposit() {
         chain.mineDeposit(txHash, invoiceId, AMOUNT);
         chain.mineEmpty(CONFIRMATIONS);
         watcher.poll(chain);
+    }
+
+    private void openInvoiceAwaitingItsEscrow(String id) {
+        invoices.open(new Invoice(
+                id, "PO-" + id, "seller-" + run, "buyer-" + run, AMOUNT, Clock.systemUTC().instant()));
+        invoices.transition(id, InvoiceStatus.SUBMITTED, null, null);
+        invoices.transition(id, InvoiceStatus.BUYER_ACCEPTED, null, null);
+        invoices.transition(id, InvoiceStatus.ESCROW_PENDING, null, null);
+    }
+
+    /** A second watcher on a second pool, so its writes commit on a connection of their own. */
+    private EscrowWatcher watcherOn(Database other) {
+        Clock clock = Clock.systemUTC();
+        PostgresLedger otherLedger = new PostgresLedger(other.dsl(), clock);
+        PostgresInvoices otherInvoices = new PostgresInvoices(other.dsl(), clock);
+        PostgresTransferService otherTransfers = new PostgresTransferService(other.dsl(), clock);
+        return new EscrowWatcher(
+                other.dsl(),
+                new PostgresChainObservations(other.dsl(), clock),
+                new InvoiceSettlement(other.dsl(), otherLedger, otherInvoices, otherTransfers),
+                CONFIRMATIONS);
     }
 
     private AccountId openAccount(String id, Account.Kind kind) {
@@ -362,7 +434,7 @@ class ReconcilerTest {
         LocalDateTime at = LocalDateTime.now(ZoneOffset.UTC);
 
         dsl.transaction(config -> {
-            org.jooq.DSLContext transaction = org.jooq.impl.DSL.using(config);
+            DSLContext transaction = DSL.using(config);
             transaction.insertInto(TRANSFER)
                     .set(TRANSFER.ID, transferId)
                     .set(TRANSFER.IDEMPOTENCY_KEY, "bypassed-" + transferId)

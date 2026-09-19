@@ -217,6 +217,19 @@ of the data to the per-deposit ones. When both fire on the same fault they corro
 each other; when only the aggregate fires, something reached the chain account by a route
 the per-deposit checks do not look at.
 
+**Every check reads one snapshot.** The run is a single `repeatable read` transaction,
+and that is the only reason it is a transaction at all, since the checks write nothing
+they read. Under `read committed` each statement takes its own snapshot, so a settlement
+committing between the two halves of the aggregate check would be counted by one and not
+the other, and the run would report a chain account short by exactly one deposit that had
+been credited perfectly. A reconciler that cries wolf every few runs is worse than no
+reconciler, because it teaches an operator to close the alert without reading it. Not
+`serializable`: that protects against write skew, and this writes nothing the checks read.
+
+The cost is an open snapshot for the length of the run, which holds vacuum back on a large
+book. That is one of the reasons the next version reconciles from a watermark rather than
+scanning everything.
+
 **Nothing here repairs anything.** A reconciler that silently corrects what it finds
 destroys the evidence of how the books came to be wrong, and the second occurrence then
 looks like the first.
@@ -290,7 +303,7 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-140 tests, all green: the domain rules in microseconds with no database, the storage layer
+141 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -345,6 +358,7 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A customer account driven negative by a write that skipped the rules is caught | same |
 | Money leaving the chain account by any other route breaks the aggregate check | same |
 | A run and its findings are stored, and read back as they were found | same |
+| A settlement committing mid-run cannot make the reconciler cry wolf | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 
 ```bash

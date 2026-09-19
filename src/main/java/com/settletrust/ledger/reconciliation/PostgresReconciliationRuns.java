@@ -1,6 +1,7 @@
 package com.settletrust.ledger.reconciliation;
 
 import com.settletrust.ledger.Money;
+import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.Record;
 import org.jooq.impl.DSL;
@@ -21,6 +22,9 @@ import static com.settletrust.ledger.jooq.Tables.RECONCILIATION_RUN;
  * <p>A run and its findings are written in one transaction. A report that recorded four
  * findings and then failed before the fifth would understate the problem, which is the
  * one thing a reconciliation record must never do.
+ *
+ * <p>{@link #recordWithin} lets that transaction be the caller's, so the reconciler can
+ * store a report under the same snapshot the report describes.
  */
 public class PostgresReconciliationRuns {
 
@@ -34,34 +38,40 @@ public class PostgresReconciliationRuns {
     }
 
     public void record(ReconciliationReport report) {
-        dsl.transaction(config -> {
-            DSLContext transaction = DSL.using(config);
+        dsl.transaction(config -> recordWithin(config, report));
+    }
 
-            transaction.insertInto(RECONCILIATION_RUN)
-                    .set(RECONCILIATION_RUN.ID, report.runId())
-                    .set(RECONCILIATION_RUN.RAN_AT,
-                            LocalDateTime.ofInstant(report.ranAt(), ZoneOffset.UTC))
-                    .set(RECONCILIATION_RUN.OBSERVATIONS_CHECKED, report.observationsChecked())
-                    .set(RECONCILIATION_RUN.TRANSFERS_CHECKED, report.transfersChecked())
-                    .set(RECONCILIATION_RUN.DISCREPANCY_COUNT, report.discrepancies().size())
+    /**
+     * Stores a report inside a transaction the caller owns, which is how the reconciler
+     * uses it: the report is written under the same snapshot it describes.
+     */
+    public void recordWithin(Configuration config, ReconciliationReport report) {
+        DSLContext transaction = DSL.using(config);
+
+        transaction.insertInto(RECONCILIATION_RUN)
+                .set(RECONCILIATION_RUN.ID, report.runId())
+                .set(RECONCILIATION_RUN.RAN_AT,
+                        LocalDateTime.ofInstant(report.ranAt(), ZoneOffset.UTC))
+                .set(RECONCILIATION_RUN.OBSERVATIONS_CHECKED, report.observationsChecked())
+                .set(RECONCILIATION_RUN.TRANSFERS_CHECKED, report.transfersChecked())
+                .set(RECONCILIATION_RUN.DISCREPANCY_COUNT, report.discrepancies().size())
+                .execute();
+
+        for (Discrepancy discrepancy : report.discrepancies()) {
+            transaction.insertInto(RECONCILIATION_FINDING)
+                    .set(RECONCILIATION_FINDING.ID, UUID.randomUUID())
+                    .set(RECONCILIATION_FINDING.RUN_ID, report.runId())
+                    .set(RECONCILIATION_FINDING.KIND, discrepancy.kind().name())
+                    .set(RECONCILIATION_FINDING.SUBJECT, discrepancy.subject())
+                    .set(RECONCILIATION_FINDING.DETAIL, truncated(discrepancy.detail()))
+                    .set(RECONCILIATION_FINDING.EXPECTED_MINOR,
+                            discrepancy.expectedAmount().map(Money::minorUnits).orElse(null))
+                    .set(RECONCILIATION_FINDING.FOUND_MINOR,
+                            discrepancy.foundAmount().map(Money::minorUnits).orElse(null))
+                    .set(RECONCILIATION_FINDING.CURRENCY,
+                            discrepancy.currency().orElse(null))
                     .execute();
-
-            for (Discrepancy discrepancy : report.discrepancies()) {
-                transaction.insertInto(RECONCILIATION_FINDING)
-                        .set(RECONCILIATION_FINDING.ID, UUID.randomUUID())
-                        .set(RECONCILIATION_FINDING.RUN_ID, report.runId())
-                        .set(RECONCILIATION_FINDING.KIND, discrepancy.kind().name())
-                        .set(RECONCILIATION_FINDING.SUBJECT, discrepancy.subject())
-                        .set(RECONCILIATION_FINDING.DETAIL, truncated(discrepancy.detail()))
-                        .set(RECONCILIATION_FINDING.EXPECTED_MINOR,
-                                discrepancy.expectedAmount().map(Money::minorUnits).orElse(null))
-                        .set(RECONCILIATION_FINDING.FOUND_MINOR,
-                                discrepancy.foundAmount().map(Money::minorUnits).orElse(null))
-                        .set(RECONCILIATION_FINDING.CURRENCY,
-                                discrepancy.currency().orElse(null))
-                        .execute();
-            }
-        });
+        }
     }
 
     public Optional<ReconciliationReport> latest() {
