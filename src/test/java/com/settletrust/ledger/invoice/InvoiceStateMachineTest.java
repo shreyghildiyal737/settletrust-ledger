@@ -21,6 +21,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * The lifecycle, with no database in sight. These run in microseconds, which is the point
  * of keeping the rules in a class that reads nothing and writes nothing.
+ *
+ * <p>What is here is the cases that are one scenario each, and the exhaustive set
+ * assertions. The refusal reasons and the blocked-reason lists moved to
+ * {@code InvoiceLifecycleSpec}, where they are a table and read like one.
  */
 class InvoiceStateMachineTest {
 
@@ -99,35 +103,6 @@ class InvoiceStateMachineTest {
             assertTrue(illegal.isEmpty(), "these steps are not allowed: " + illegal);
         }
 
-        @Test
-        void aDraftCannotJumpStraightToSettled() {
-            InvoiceTransitionRejected rejection = assertThrows(
-                    InvoiceTransitionRejected.class,
-                    () -> InvoiceRules.requireLegal(
-                            "inv-1", InvoiceStatus.DRAFT, InvoiceStatus.SETTLED));
-
-            assertEquals(InvoiceTransitionRejected.Reason.ILLEGAL_TRANSITION, rejection.reason());
-        }
-
-        @Test
-        void aSettledInvoiceIsFinished() {
-            InvoiceTransitionRejected rejection = assertThrows(
-                    InvoiceTransitionRejected.class,
-                    () -> InvoiceRules.requireLegal(
-                            "inv-1", InvoiceStatus.SETTLED, InvoiceStatus.DISPUTED));
-
-            assertEquals(InvoiceTransitionRejected.Reason.TERMINAL_STATE, rejection.reason());
-        }
-
-        @Test
-        void movingToWhereItAlreadyIsIsRefused() {
-            InvoiceTransitionRejected rejection = assertThrows(
-                    InvoiceTransitionRejected.class,
-                    () -> InvoiceRules.requireLegal(
-                            "inv-1", InvoiceStatus.ESCROW_FUNDED, InvoiceStatus.ESCROW_FUNDED));
-
-            assertEquals(InvoiceTransitionRejected.Reason.ILLEGAL_TRANSITION, rejection.reason());
-        }
 
         @Test
         void aDisputeAndAFreezeBothHaveAWayBack() {
@@ -158,27 +133,5 @@ class InvoiceStateMachineTest {
                     ready);
         }
 
-        @Test
-        void aDraftIsBlockedOnBothEscrowAndDelivery() {
-            assertEquals(
-                    List.of("Escrow is not funded.", "Delivery has not been confirmed."),
-                    InvoiceRules.blockedReasons(InvoiceStatus.DRAFT));
-        }
-
-        @Test
-        void aFundedEscrowStillWaitsOnDelivery() {
-            assertEquals(
-                    List.of("Delivery has not been confirmed."),
-                    InvoiceRules.blockedReasons(InvoiceStatus.ESCROW_FUNDED));
-        }
-
-        @Test
-        void aFrozenInvoiceSaysSoFirst() {
-            List<String> reasons = InvoiceRules.blockedReasons(InvoiceStatus.FROZEN);
-
-            assertAll(
-                    () -> assertEquals("Invoice is frozen by compliance.", reasons.get(0)),
-                    () -> assertFalse(InvoiceRules.readyForSettlement(InvoiceStatus.FROZEN)));
-        }
     }
 }

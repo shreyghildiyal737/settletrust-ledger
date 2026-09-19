@@ -341,11 +341,20 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-147 tests, all green: the domain rules in microseconds with no database, the storage layer
+185 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
 thread per task, so they genuinely contend.
+
+**JUnit and Spock, and the split is not arbitrary.** JUnit keeps the cases that are one
+scenario each. Spock has the parts where the subject genuinely is a table: which refusals
+carry which reason, and what an invoice is waiting for at each status. Those were a list
+of near-identical methods, and a `where:` block says the same thing in the shape the
+thing actually has. Writing the spec also turned up two properties no amount of per-case
+testing would have caught, both of which now hold: a status is final exactly when it has
+nowhere left to go, and every status is reachable from a draft. A status nobody can get
+to is dead code with a name.
 
 Most test classes isolate themselves by generating their own account ids and leaving
 everyone else's rows alone. The reconciliation tests cannot: a finding is a statement
@@ -403,6 +412,10 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | Money in the contract that nothing explains is raised as a question | same |
 | With no chain to ask, the report says so rather than reading as verified | same |
 | A second instance finds the lease taken and writes no duplicate report | same |
+| A status is final exactly when it has nowhere left to go | `InvoiceLifecycleSpec` |
+| Every status is reachable from a draft, so none is stranded | same |
+| Each illegal move carries the reason it deserves, across nine cases | same |
+| Each status reports exactly what it is waiting on, across eleven | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 
 ```bash
