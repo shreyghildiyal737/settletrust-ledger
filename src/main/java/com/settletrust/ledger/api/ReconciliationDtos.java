@@ -18,6 +18,10 @@ final class ReconciliationDtos {
      * The counts travel with the verdict on purpose. A client that only reads
      * {@code agreed} cannot tell a clean book from a run that examined nothing, and
      * "nothing to check" is what a stopped watcher looks like from here.
+     *
+     * <p>{@code reservesChecked} says whether the chain itself was asked. False means
+     * every check compared our own records against each other, which a clean verdict
+     * alone would not reveal.
      */
     record ReportView(
             UUID runId,
@@ -25,6 +29,7 @@ final class ReconciliationDtos {
             boolean agreed,
             int observationsChecked,
             int transfersChecked,
+            boolean reservesChecked,
             List<FindingView> discrepancies) {
 
         static ReportView of(ReconciliationReport report) {
@@ -34,6 +39,7 @@ final class ReconciliationDtos {
                     report.agreed(),
                     report.observationsChecked(),
                     report.transfersChecked(),
+                    report.reservesChecked(),
                     report.discrepancies().stream().map(FindingView::of).toList());
         }
     }

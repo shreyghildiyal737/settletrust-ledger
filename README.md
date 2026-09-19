@@ -211,11 +211,40 @@ which is the more expensive of the two.
 | Every `chain-deposit:` transfer has a confirmed deposit behind it | Money credited that the chain never sent |
 | `chain:<currency>` equals the negative of what the chain confirmed | Anything that touched the chain account outside the watcher |
 | No customer account is negative | A row lock that did not serialise what it was supposed to |
+| The escrow contract holds at least what the ledger credited out of it | A watcher that misread the chain, and every check above agreeing with it |
 
-The last one is the aggregate check, and it is deliberately computed from the opposite end
-of the data to the per-deposit ones. When both fire on the same fault they corroborate
-each other; when only the aggregate fires, something reached the chain account by a route
-the per-deposit checks do not look at.
+The sixth is the aggregate check, deliberately computed from the opposite end of the data
+to the per-deposit ones. When both fire on the same fault they corroborate each other;
+when only the aggregate fires, something reached the chain account by a route the
+per-deposit checks do not look at.
+
+**The last one is the only check the chain is the authority for, and it exists because of
+a hole in all the others.** Every check above it compares the ledger against
+`chain_observation`, and the watcher wrote both. A watcher that misread the chain,
+credited an event twice or invented one produces two records that agree perfectly and are
+both wrong. Nothing that cross-checks them can tell. So the reconciler asks the contract
+what it is actually holding, through a one-method `EscrowReserves` port kept separate
+from `ChainSource`: a reconciler that needs a balance should not be handed the ability to
+replay history.
+
+A shortfall is the alarm, and it is computed against the `chain:<currency>` ledger
+balance rather than the observations, so neither side of that comparison shares a source
+with the other. A surplus is a question rather than an alarm, because deposits still
+waiting for confirmations are legitimately in the contract already; only what those fail
+to explain is reported, and that remainder is either tokens sent straight to the contract
+address or an event the watcher never saw.
+
+The reads are ordered so the alarm cannot be wrong. The database snapshot is taken first
+and the chain asked last, so the chain's answer is never older than the ledger it is
+compared against. A deposit confirmed mid-run therefore shows up on chain and not in the
+ledger, which inflates the surplus and can never manufacture a shortfall. The timing
+artefact lands on the finding that tolerates one.
+
+**And the report says whether it asked.** No `EscrowReserves` bean exists yet, because
+the contract is written and not deployed, so every report this service currently produces
+carries `reservesChecked: false`. Without that flag a report from a deployment with no
+node would be indistinguishable from one that had verified the money was really there,
+and the second is what an operator would assume.
 
 **Every check reads one snapshot.** The run is a single `repeatable read` transaction,
 and that is the only reason it is a transaction at all, since the checks write nothing
@@ -235,10 +264,10 @@ destroys the evidence of how the books came to be wrong, and the second occurren
 looks like the first.
 
 Runs are stored, findings and all, in `reconciliation_run` and `reconciliation_finding`,
-both append-only like everything else that is a record of what happened. The counts are
-stored with the verdict on purpose: "no discrepancies" means nothing on its own, because a
-run that checked nothing because the watcher had silently stopped reports exactly the same
-thing as a healthy one.
+both append-only like everything else that is a record of what happened. The counts and
+the `reserves_checked` flag are stored with the verdict on purpose: "no discrepancies"
+means nothing on its own, because a run that checked nothing because the watcher had
+silently stopped reports exactly the same thing as a healthy one.
 
 A fixed delay drives it, not a fixed rate, so a slow pass on a large book cannot queue
 runs behind itself. There is one honest limitation: two instances against one database
@@ -265,7 +294,7 @@ at.
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
 | `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
-| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body. |
+| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `reservesChecked` saying whether the chain was asked. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
 
 ```http
@@ -303,7 +332,7 @@ Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates
 
 ## Tests
 
-141 tests, all green: the domain rules in microseconds with no database, the storage layer
+146 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -359,6 +388,11 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | Money leaving the chain account by any other route breaks the aggregate check | same |
 | A run and its findings are stored, and read back as they were found | same |
 | A settlement committing mid-run cannot make the reconciler cry wolf | same |
+| A contract holding what the ledger credited reconciles, and the run says it asked | same |
+| A contract short of what the ledger credited is caught when nothing else can be | same |
+| A deposit still awaiting confirmations explains a surplus rather than raising one | same |
+| Money in the contract that nothing explains is raised as a question | same |
+| With no chain to ask, the report says so rather than reading as verified | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 
 ```bash
@@ -382,12 +416,16 @@ mvn test
 generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
 settlement, the on-chain deposit rail with its reorg handling, reconciliation and its
 schedule, and the tests above. The escrow contract is written but not yet deployed or run
-against a node.
+against a node, so the reserve check has a port and a fake and no live implementation:
+every report this service produces today says `reservesChecked: false`, and means it.
 
 **Next, in order:**
 
-1. A `ChainSource` backed by a real Ethereum client, and the contract deployed to a local
-   chain so the rail is exercised end to end rather than against a fake.
+1. A `ChainSource` and an `EscrowReserves` backed by a real Ethereum client, with the
+   contract deployed to a local chain. One piece of work now, since the reserve check is
+   the thing that most needs a real node and the port it needs is already there.
 2. A lease on the reconciliation schedule, so more than one instance can run safely.
+3. Reconciliation from a watermark with a periodic full sweep, so the snapshot is not held
+   open across the whole book.
 
 One ledger, two settlement rails.

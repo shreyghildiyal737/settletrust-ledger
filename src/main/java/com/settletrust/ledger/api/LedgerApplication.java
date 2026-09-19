@@ -3,6 +3,7 @@ package com.settletrust.ledger.api;
 import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
+import com.settletrust.ledger.chain.EscrowReserves;
 import com.settletrust.ledger.invoice.PostgresInvoices;
 import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
 import com.settletrust.ledger.reconciliation.Reconciler;
@@ -12,6 +13,7 @@ import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
@@ -71,9 +73,19 @@ public class LedgerApplication {
         return new PostgresReconciliationRuns(dsl);
     }
 
+    /**
+     * Takes a chain to ask about reserves if one is configured, and none otherwise. No
+     * {@link EscrowReserves} bean exists yet, because the contract is written and not
+     * deployed; the reconciler records that its reports were produced without one rather
+     * than letting them read as verified.
+     */
     @Bean
-    Reconciler reconciler(DSLContext dsl, Clock clock, PostgresReconciliationRuns runs) {
-        return new Reconciler(dsl, clock, runs);
+    Reconciler reconciler(
+            DSLContext dsl,
+            Clock clock,
+            PostgresReconciliationRuns runs,
+            ObjectProvider<EscrowReserves> reserves) {
+        return new Reconciler(dsl, clock, runs, reserves.getIfAvailable());
     }
 
     @Bean

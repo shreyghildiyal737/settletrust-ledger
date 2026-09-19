@@ -3,7 +3,9 @@ package com.settletrust.ledger.chain;
 import com.settletrust.ledger.Money;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -19,12 +21,19 @@ import java.util.Optional;
  * <p>Block numbers are positions in the list, so rolling back and mining again produces
  * exactly what a reorganisation produces: the same height, a different block.
  */
-public final class FakeChain implements ChainSource {
+public final class FakeChain implements ChainSource, EscrowReserves {
 
     private record Block(String hash, List<ChainDeposit> deposits) {
     }
 
     private final List<Block> blocks = new ArrayList<>();
+
+    /**
+     * What the contract holds beyond the deposits it was told about, so a test can make
+     * the chain and the ledger disagree in either direction.
+     */
+    private final Map<String, Long> offChainBook = new HashMap<>();
+
     private int minted;
 
     public FakeChain() {
@@ -51,6 +60,33 @@ public final class FakeChain implements ChainSource {
             return Optional.empty();
         }
         return Optional.of(blocks.get((int) blockNumber).hash());
+    }
+
+    /**
+     * The sum of every deposit still on the canonical chain. Blocks dropped by a
+     * reorganisation take their deposits with them, which is what the real contract
+     * balance would do too.
+     */
+    @Override
+    public List<Money> heldOnChain() {
+        Map<String, Long> totals = new HashMap<>(offChainBook);
+        for (Block block : blocks) {
+            for (ChainDeposit deposit : block.deposits()) {
+                totals.merge(
+                        deposit.amount().currency(), deposit.amount().minorUnits(), Long::sum);
+            }
+        }
+        return totals.entrySet().stream()
+                .map(held -> Money.of(held.getValue(), held.getKey()))
+                .toList();
+    }
+
+    /**
+     * Moves the contract balance without an event, the way a direct transfer to the
+     * contract address or a watcher that misread the chain would.
+     */
+    public void adjustHeldOnChain(Money delta) {
+        offChainBook.merge(delta.currency(), delta.minorUnits(), Long::sum);
     }
 
     /** Mines {@code count} blocks containing nothing, to bury what came before them. */

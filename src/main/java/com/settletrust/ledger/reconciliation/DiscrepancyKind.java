@@ -47,5 +47,24 @@ public enum DiscrepancyKind {
     CHAIN_ACCOUNT_DISAGREES,
 
     /** A customer account is negative, which the transfer rules are supposed to make impossible. */
-    CUSTOMER_ACCOUNT_OVERDRAWN
+    CUSTOMER_ACCOUNT_OVERDRAWN,
+
+    /**
+     * The escrow contract holds less than the ledger has already credited from it.
+     *
+     * <p>The only finding here that the chain, rather than our own record of the chain,
+     * is the authority for. Every other check would still pass if the watcher had
+     * misread the chain, because it wrote both sides of what they compare. This one
+     * cannot: the money is either in the contract or it is not.
+     */
+    RESERVES_SHORT,
+
+    /**
+     * The escrow contract holds more than the ledger can account for.
+     *
+     * <p>Softer than a shortfall and still worth a look. Tokens sent straight to the
+     * contract address by someone skipping the flow land here, and so does an event the
+     * watcher never saw, which is a failure nothing else in this reconciler detects.
+     */
+    RESERVES_UNACCOUNTED
 }

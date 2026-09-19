@@ -1,6 +1,7 @@
 package com.settletrust.ledger.reconciliation;
 
 import com.settletrust.ledger.Money;
+import com.settletrust.ledger.chain.EscrowReserves;
 import com.settletrust.ledger.chain.ObservationStatus;
 import com.settletrust.ledger.settlement.InvoiceSettlement;
 import com.settletrust.ledger.settlement.SettlementKeys;
@@ -17,6 +18,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.UUID;
 
 import static com.settletrust.ledger.jooq.Tables.ACCOUNT;
@@ -48,11 +51,25 @@ public class Reconciler {
     private final DSLContext dsl;
     private final Clock clock;
     private final PostgresReconciliationRuns runs;
+    private final EscrowReserves reserves;
 
+    /** Without a chain to ask, so every check compares our own records against each other. */
     public Reconciler(DSLContext dsl, Clock clock, PostgresReconciliationRuns runs) {
+        this(dsl, clock, runs, null);
+    }
+
+    /**
+     * @param reserves the chain itself, or null where no node is configured. Null is
+     *                 permitted because a deployment without a node still needs the other
+     *                 checks, and the report records which of the two it was rather than
+     *                 letting an unchecked run read as a verified one.
+     */
+    public Reconciler(
+            DSLContext dsl, Clock clock, PostgresReconciliationRuns runs, EscrowReserves reserves) {
         this.dsl = Objects.requireNonNull(dsl, "dsl must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.runs = Objects.requireNonNull(runs, "runs must not be null");
+        this.reserves = reserves;
     }
 
     /**
@@ -95,11 +112,16 @@ public class Reconciler {
             found.addAll(chainAccountsAgainstWhatTheChainSent(snapshot));
             found.addAll(overdrawnCustomerAccounts(snapshot));
 
+            // Last, and outside the snapshot of necessity, because the chain has no
+            // snapshot to join. See reservesAgainstTheChain for why the order matters.
+            found.addAll(reservesAgainstTheChain(snapshot));
+
             ReconciliationReport report = new ReconciliationReport(
                     UUID.randomUUID(),
                     clock.instant(),
                     deposits.checked(),
                     countOfTransfers(snapshot),
+                    reserves != null,
                     found);
 
             // Written inside the same transaction, so the report lands with the snapshot
@@ -386,6 +408,100 @@ public class Reconciler {
                             Money.zero(currency),
                             held);
                 });
+    }
+
+    /**
+     * The one check the chain, rather than our record of the chain, is the authority for.
+     *
+     * <p>Everything above compares the ledger against {@code chain_observation}, and the
+     * watcher wrote both. A watcher that misread the chain produces two records that
+     * agree beautifully and are both wrong, and no amount of cross-checking them finds
+     * it. So this asks the contract what it is actually holding.
+     *
+     * <p><b>A shortfall is the alarm.</b> A contract holding less than the ledger has
+     * already credited out of it means the platform has paid out against money that is
+     * not there. It is computed from the {@code chain:<currency>} balance, which is a
+     * ledger figure, rather than from the observations, so the two sides of the
+     * comparison share no source.
+     *
+     * <p><b>A surplus is a question, not an alarm.</b> The contract legitimately holds
+     * more than the ledger has credited, because deposits still waiting for their
+     * confirmations are already in there. Only what those fail to explain is reported,
+     * and that remainder is either somebody sending tokens straight to the contract
+     * address or an event the watcher never saw. The second is a real failure that
+     * nothing else here can detect.
+     *
+     * <p><b>Why the reads are ordered as they are.</b> The database snapshot is taken
+     * first and the chain asked last, so the chain answer is never older than the ledger
+     * it is compared against. A deposit confirmed while the run is in flight therefore
+     * shows up in the chain balance and not in the ledger, which inflates the surplus and
+     * can never manufacture a shortfall. The timing artefact lands on the finding that
+     * tolerates one, and the alarming finding stays true whenever it fires.
+     */
+    private List<Discrepancy> reservesAgainstTheChain(DSLContext snapshot) {
+        if (reserves == null) {
+            return List.of();
+        }
+
+        Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
+        Map<String, Long> credited = new HashMap<>();
+        snapshot.select(ACCOUNT.CURRENCY, balance)
+                .from(ACCOUNT)
+                .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
+                .where(ACCOUNT.ID.startsWith(InvoiceSettlement.CHAIN_ACCOUNT_PREFIX))
+                .groupBy(ACCOUNT.CURRENCY)
+                .fetch()
+                // Negated: the chain account is down by whatever it has lent to escrows,
+                // and that is exactly what the contract should still be holding.
+                .forEach(row -> credited.put(
+                        row.get(ACCOUNT.CURRENCY), -row.get(balance).longValueExact()));
+
+        Field<BigDecimal> waiting = DSL.sum(CHAIN_OBSERVATION.AMOUNT_MINOR);
+        Map<String, Long> awaitingConfirmation = new HashMap<>();
+        snapshot.select(CHAIN_OBSERVATION.CURRENCY, waiting)
+                .from(CHAIN_OBSERVATION)
+                .where(CHAIN_OBSERVATION.STATUS.eq(ObservationStatus.PENDING.name()))
+                .groupBy(CHAIN_OBSERVATION.CURRENCY)
+                .fetch()
+                .forEach(row -> awaitingConfirmation.put(
+                        row.get(CHAIN_OBSERVATION.CURRENCY), row.get(waiting).longValueExact()));
+
+        Map<String, Long> held = new HashMap<>();
+        for (Money onChain : reserves.heldOnChain()) {
+            held.merge(onChain.currency(), onChain.minorUnits(), Long::sum);
+        }
+
+        List<Discrepancy> found = new ArrayList<>();
+        Set<String> currencies = new TreeSet<>(held.keySet());
+        currencies.addAll(credited.keySet());
+
+        for (String currency : currencies) {
+            long onChain = held.getOrDefault(currency, 0L);
+            long owed = credited.getOrDefault(currency, 0L);
+
+            if (onChain < owed) {
+                found.add(Discrepancy.mismatch(
+                        DiscrepancyKind.RESERVES_SHORT,
+                        InvoiceSettlement.chainAccountFor(currency).value(),
+                        "the ledger has credited " + Money.of(owed, currency)
+                                + " out of a contract holding " + Money.of(onChain, currency),
+                        Money.of(owed, currency),
+                        Money.of(onChain, currency)));
+                continue;
+            }
+
+            long explained = Math.addExact(owed, awaitingConfirmation.getOrDefault(currency, 0L));
+            if (onChain > explained) {
+                found.add(Discrepancy.mismatch(
+                        DiscrepancyKind.RESERVES_UNACCOUNTED,
+                        InvoiceSettlement.chainAccountFor(currency).value(),
+                        "the contract holds " + Money.of(onChain - explained, currency)
+                                + " more than credited and pending deposits explain",
+                        Money.of(explained, currency),
+                        Money.of(onChain, currency)));
+            }
+        }
+        return found;
     }
 
     private static int countOfTransfers(DSLContext snapshot) {

@@ -39,6 +39,7 @@ import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
 import static com.settletrust.ledger.jooq.Tables.TRANSFER;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -73,6 +74,7 @@ class ReconcilerTest {
     private EscrowWatcher watcher;
     private PostgresReconciliationRuns runs;
     private Reconciler reconciler;
+    private Reconciler reconcilerAskingTheChain;
     private FakeChain chain;
 
     private String run;
@@ -93,8 +95,12 @@ class ReconcilerTest {
         observations = new PostgresChainObservations(dsl, clock);
         watcher = new EscrowWatcher(dsl, observations, settlement, CONFIRMATIONS);
         runs = new PostgresReconciliationRuns(dsl);
-        reconciler = new Reconciler(dsl, clock, runs);
         chain = new FakeChain();
+
+        // Two of them, because "what does a run report when there is no chain to ask" is
+        // itself a thing worth asserting.
+        reconciler = new Reconciler(dsl, clock, runs);
+        reconcilerAskingTheChain = new Reconciler(dsl, clock, runs, chain);
 
         run = UUID.randomUUID().toString().substring(0, 8);
         invoiceId = "inv-" + run;
@@ -362,6 +368,100 @@ class ReconcilerTest {
                     () -> assertEquals(2, reconciler.run().observationsChecked(),
                             "and the deposit that raced it really had committed"));
         }
+    }
+
+    @Test
+    @DisplayName("a contract holding what the ledger credited reconciles, and says it asked")
+    void theChainBacksWhatWasCredited() {
+        confirmTheDeposit();
+
+        ReconciliationReport report = reconcilerAskingTheChain.run();
+
+        assertAll(
+                () -> assertTrue(report.agreed(), () -> "unexpected: " + report.discrepancies()),
+                () -> assertTrue(report.reservesChecked(),
+                        "a clean report that never asked the chain is not the same report"));
+    }
+
+    @Test
+    @DisplayName("a contract holding less than the ledger credited is a shortfall")
+    void aContractShortOfWhatWasCreditedIsCaught() {
+        confirmTheDeposit();
+
+        // The money leaves the contract without an event, which is what a watcher that
+        // misread the chain looks like from the outside. Every other check still passes,
+        // because the watcher wrote both sides of what they compare.
+        chain.adjustHeldOnChain(Money.of(-1_000L, "EURC"));
+
+        ReconciliationReport report = reconcilerAskingTheChain.run();
+
+        assertAll(
+                () -> assertEquals(1, report.discrepancies().size(),
+                        () -> "exactly one thing is wrong: " + report.discrepancies()),
+                () -> assertEquals(DiscrepancyKind.RESERVES_SHORT,
+                        report.discrepancies().getFirst().kind()),
+                () -> assertEquals(AMOUNT,
+                        report.discrepancies().getFirst().expectedAmount().orElseThrow()),
+                () -> assertEquals(Money.of(AMOUNT.minorUnits() - 1_000L, "EURC"),
+                        report.discrepancies().getFirst().foundAmount().orElseThrow()));
+    }
+
+    @Test
+    @DisplayName("a deposit still waiting for its confirmations explains a surplus")
+    void moneyWaitingToBeCreditedIsNotASurplus() {
+        confirmTheDeposit();
+
+        // On chain and in the contract, deliberately not credited yet. Without counting
+        // it, the contract would look like it was holding money nobody could explain.
+        String secondInvoice = "inv2-" + run;
+        openInvoiceAwaitingItsEscrow(secondInvoice);
+        chain.mineDeposit("0xtx2" + run, secondInvoice, AMOUNT);
+        watcher.poll(chain);
+
+        ReconciliationReport report = reconcilerAskingTheChain.run();
+
+        assertAll(
+                () -> assertEquals(ObservationStatus.PENDING,
+                        observations.find("0xtx2" + run, 0).orElseThrow().status()),
+                () -> assertTrue(report.agreed(), () -> "unexpected: " + report.discrepancies()));
+    }
+
+    @Test
+    @DisplayName("money in the contract that nothing explains is raised as a question")
+    void anUnexplainedSurplusIsRaised() {
+        confirmTheDeposit();
+
+        // Somebody sent tokens straight to the contract address, or the watcher missed an
+        // event. The second is a failure no other check in here can see.
+        chain.adjustHeldOnChain(Money.of(5_000L, "EURC"));
+
+        ReconciliationReport report = reconcilerAskingTheChain.run();
+
+        assertAll(
+                () -> assertEquals(1, report.discrepancies().size(),
+                        () -> "exactly one thing is wrong: " + report.discrepancies()),
+                () -> assertEquals(DiscrepancyKind.RESERVES_UNACCOUNTED,
+                        report.discrepancies().getFirst().kind()),
+                () -> assertEquals(Money.of(AMOUNT.minorUnits() + 5_000L, "EURC"),
+                        report.discrepancies().getFirst().foundAmount().orElseThrow()));
+    }
+
+    @Test
+    @DisplayName("with no chain to ask, the report says so rather than reading as verified")
+    void anUncheckedRunDoesNotPassItselfOffAsAVerifiedOne() {
+        confirmTheDeposit();
+        chain.adjustHeldOnChain(Money.of(-1_000L, "EURC"));
+
+        // The same shortfall the previous test catches. This reconciler has no chain, so
+        // it cannot see it, and the only thing standing between that and a report an
+        // operator would read as proof is the flag.
+        ReconciliationReport report = reconciler.run();
+
+        assertAll(
+                () -> assertTrue(report.agreed(),
+                        "it genuinely agrees on everything it is able to look at"),
+                () -> assertFalse(report.reservesChecked(),
+                        "and the report has to admit what it did not look at"));
     }
 
     private void confirmTheDeposit() {

@@ -55,6 +55,7 @@ public class PostgresReconciliationRuns {
                 .set(RECONCILIATION_RUN.OBSERVATIONS_CHECKED, report.observationsChecked())
                 .set(RECONCILIATION_RUN.TRANSFERS_CHECKED, report.transfersChecked())
                 .set(RECONCILIATION_RUN.DISCREPANCY_COUNT, report.discrepancies().size())
+                .set(RECONCILIATION_RUN.RESERVES_CHECKED, report.reservesChecked())
                 .execute();
 
         for (Discrepancy discrepancy : report.discrepancies()) {
@@ -103,6 +104,7 @@ public class PostgresReconciliationRuns {
                 run.get(RECONCILIATION_RUN.RAN_AT).toInstant(ZoneOffset.UTC),
                 run.get(RECONCILIATION_RUN.OBSERVATIONS_CHECKED),
                 run.get(RECONCILIATION_RUN.TRANSFERS_CHECKED),
+                run.get(RECONCILIATION_RUN.RESERVES_CHECKED),
                 findings);
     }
 

@@ -59,6 +59,9 @@ class ReconciliationApiTest {
                 .andExpect(jsonPath("$.agreed", notNullValue()))
                 .andExpect(jsonPath("$.observationsChecked", greaterThanOrEqualTo(0)))
                 .andExpect(jsonPath("$.transfersChecked", greaterThanOrEqualTo(0)))
+                // False here, and it should be: no node is configured, so the edge has to
+                // report a run that compared our own records against each other.
+                .andExpect(jsonPath("$.reservesChecked", is(false)))
                 .andReturn();
 
         String runId = json.readTree(created.getResponse().getContentAsString())
