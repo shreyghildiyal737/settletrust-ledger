@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: settletrust-ledger-config
+data:
+  # Everything here is non-secret configuration. The database credentials come from a
+  # Secret, and the URL is here because a hostname is not a credential.
+  LEDGER_JDBC_URL: jdbc:postgresql://postgres:5432/settletrust_ledger
+
+  LEDGER_RECONCILIATION_ENABLED: "true"
+  LEDGER_RECONCILIATION_INTERVAL: PT15M
+  # Longer than the startup probe's worst case, so a replica is serving traffic before
+  # it starts scanning the book.
+  LEDGER_RECONCILIATION_INITIAL_DELAY: PT3M
+
+  SQL_LOG_LEVEL: warn

@@ -1,0 +1,110 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: settletrust-ledger
+  labels:
+    app.kubernetes.io/name: settletrust-ledger
+spec:
+  # Two on purpose. The reconciler takes a Postgres advisory lock before it runs, so one
+  # replica does the work and the other finds the lease taken and goes back to sleep.
+  # Running a single replica would hide whether that lease is actually load-bearing.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: settletrust-ledger
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: settletrust-ledger
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: ledger
+          image: settletrust-ledger:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: settletrust-ledger-config
+          env:
+            - name: LEDGER_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: settletrust-ledger-db
+                  key: username
+            - name: LEDGER_DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: settletrust-ledger-db
+                  key: password
+
+          # Flyway runs on startup and the JVM is not quick, so the startup probe is what
+          # gives it room. Without it the liveness probe would start counting immediately
+          # and restart a pod that was migrating perfectly well, forever.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 30
+
+          # Liveness asks only whether the process is wedged. It deliberately does not
+          # check the database: a pod that cannot reach Postgres is not broken, the
+          # database is, and restarting every replica while it recovers makes the outage
+          # worse rather than shorter.
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Readiness does check it, because a replica that cannot reach Postgres cannot
+          # answer a request and should leave the load balancer until it can.
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              # No CPU limit on purpose. Throttling a JVM mid-request to enforce a ceiling
+              # nobody is contending for adds latency and saves nothing; the request is
+              # what the scheduler needs. Memory is limited because exceeding it is not a
+              # slowdown, it is a kill.
+              memory: 512Mi
+
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+
+      # The root filesystem is read only, and the JVM still wants somewhere to write.
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Longer than the reconciliation interval is pointless, but a run in flight should
+      # be allowed to finish rather than leave a half-written report. It cannot leave one:
+      # the run is a single transaction. This is for in-flight HTTP requests.
+      terminationGracePeriodSeconds: 30

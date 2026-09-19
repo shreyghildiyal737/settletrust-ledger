@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer stale, so it is cancelled
+# rather than left to finish and report on code nobody has any more.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: maven
+
+      # No service container and no LEDGER_TEST_JDBC_URL. The runner has a working Docker
+      # daemon, so Testcontainers starts its own Postgres, which is the path the suite is
+      # written for. The environment overrides exist for developer machines where
+      # Testcontainers cannot reach Docker, and using them here would mean CI stopped
+      # exercising the default.
+      - name: Test
+        run: mvn -B verify
+
+      # Kept even on a green run: the report is the artifact worth having when a test
+      # fails on the runner and passes locally.
+      - name: Test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: target/surefire-reports/
+          retention-days: 7
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Built and not pushed. There is no registry to push to yet, and a build that
+      # fails only at deploy time is a build that was not really checked.
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: settletrust-ledger:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Schema validation, not a deploy. It catches the class of mistake that otherwise
+      # surfaces as a rejected apply during an incident, which is the worst time to find
+      # a typo in a probe path.
+      - name: Validate the Kubernetes manifests
+        run: |
+          docker run --rm -v "$PWD/k8s:/work" ghcr.io/yannh/kubeconform:latest \
+            -summary -strict -verbose /work

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: settletrust-ledger
+  labels:
+    app.kubernetes.io/name: settletrust-ledger
+spec:
+  # ClusterIP, not LoadBalancer. This is an internal money-movement API; what should be
+  # in front of it is an ingress that terminates TLS and authenticates, and putting that
+  # decision in a Service type is how it gets skipped.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: settletrust-ledger
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

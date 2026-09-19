@@ -58,6 +58,11 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
+    <!-- Only for the health endpoints the container probes read. -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.flywaydb</groupId>

@@ -339,6 +339,55 @@ mvn spring-boot:run
 
 Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates on start.
 
+## Running it in a cluster
+
+```bash
+docker build -t settletrust-ledger:local .
+kubectl apply -f k8s/
+```
+
+Two stages in the `Dockerfile`, because the image that runs a ledger should not contain a
+compiler, a Maven cache or the source. The final image is a JRE, a jar and a user that is
+not root. `MaxRAMPercentage` is set because a JVM that sizes its heap against the node
+rather than the cgroup gets killed by the kernel, which tells nobody why.
+
+**Two replicas in the Deployment, on purpose.** The reconciler takes its lease before it
+runs, so one replica does the work and the other finds it taken. A single replica would
+leave that lease untested by the thing that is supposed to need it.
+
+**The probes are not the same check.** This is the part worth reading:
+
+| Probe | Includes the database | Why |
+|---|---|---|
+| `startup` | yes | Flyway runs on boot and the JVM is not quick. Without it, liveness starts counting against a pod that is migrating perfectly well |
+| `liveness` | **no** | A pod that cannot reach Postgres is not broken, the database is. Restarting every replica in a loop while it recovers makes the outage worse |
+| `readiness` | yes | A replica that cannot reach Postgres cannot answer, and should leave the load balancer until it can |
+
+Memory is limited and CPU is not. Exceeding a memory limit is a kill rather than a
+slowdown, so the limit is real protection; throttling a JVM mid-request to enforce a CPU
+ceiling nobody is contending for adds latency and saves nothing, and the request is what
+the scheduler actually needs.
+
+There is no Postgres in `k8s/`, deliberately. A StatefulSet running the database that
+holds the ledger is a worse answer than a managed instance, and shipping one here would
+suggest otherwise. `secret.example.yaml` is an example for the same reason: a base64
+string in a repository is an unencrypted password with an extra step.
+
+`.github/workflows/build.yml` runs the suite on Testcontainers rather than a service
+container, so CI exercises the same default path a fresh clone does, and builds the image
+and validates the manifests alongside it.
+
+**Verified how far.** The image builds and runs as uid 1000 on a read-only root
+filesystem. The manifests pass `kubeconform -strict` against the real Kubernetes
+schemas. The probe split was tested rather than asserted: with the service running
+against a Postgres in its own container, stopping that Postgres leaves liveness at
+`200 UP` and takes readiness to `503 DOWN`, and starting it again brings readiness back
+with the restart count still at zero. That is the whole argument for the split, and it
+holds: the pod rides out a database outage instead of being killed through one.
+
+**Nothing here has been applied to a running cluster.** Kubernetes is the one thing in
+this repository that has not been operated, and no amount of valid YAML changes that.
+
 ## Tests
 
 185 tests, all green: the domain rules in microseconds with no database, the storage layer

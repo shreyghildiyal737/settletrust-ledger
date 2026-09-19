@@ -26,6 +26,30 @@ ledger:
     interval: ${LEDGER_RECONCILIATION_INTERVAL:PT15M}
     initial-delay: ${LEDGER_RECONCILIATION_INITIAL_DELAY:PT1M}
 
+management:
+  endpoints:
+    web:
+      exposure:
+        # Health only. Everything else actuator can expose is either useless to an
+        # orchestrator or something that should not be reachable from inside the cluster
+        # without a reason.
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      group:
+        # Liveness deliberately excludes the database. A pod that cannot reach Postgres
+        # is not broken, the database is, and restarting every replica in a loop while it
+        # recovers turns an outage into a worse one.
+        liveness:
+          include: livenessState
+        # Readiness includes it, because a replica that cannot reach Postgres cannot
+        # serve a request and should be taken out of the load balancer until it can.
+        readiness:
+          include: readinessState,db
+      show-details: never
+
 server:
   port: ${PORT:8080}
   error:
