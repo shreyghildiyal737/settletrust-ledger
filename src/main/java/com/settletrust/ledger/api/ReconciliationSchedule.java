@@ -1,6 +1,7 @@
 package com.settletrust.ledger.api;
 
 import com.settletrust.ledger.reconciliation.Discrepancy;
+import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
 import com.settletrust.ledger.reconciliation.ReconciliationReport;
 import com.settletrust.ledger.reconciliation.Reconciler;
 import org.slf4j.Logger;
@@ -29,9 +30,17 @@ class ReconciliationSchedule {
     private static final Logger log = LoggerFactory.getLogger(ReconciliationSchedule.class);
 
     private final Reconciler reconciler;
+    private final PostgresReconciliationRuns runs;
+    private final ReconciliationMetrics metrics;
 
-    ReconciliationSchedule(Reconciler reconciler) {
+    ReconciliationSchedule(
+            Reconciler reconciler,
+            PostgresReconciliationRuns runs,
+            ReconciliationMetrics metrics) {
+
         this.reconciler = reconciler;
+        this.runs = runs;
+        this.metrics = metrics;
     }
 
     @Scheduled(
@@ -46,16 +55,21 @@ class ReconciliationSchedule {
             // reconciler that quietly stops after one bad night is worse than no
             // reconciler, because the silence looks identical to a clean book.
             log.error("Reconciliation failed to complete", failure);
+            metrics.recordFailed();
             return;
         }
 
         if (completed.isEmpty()) {
             // Expected on every instance but one, so it is not a warning.
             log.info("Another instance holds the reconciliation lease, skipping this tick");
+            metrics.recordSkipped();
             return;
         }
 
         ReconciliationReport report = completed.get();
+        // Read back rather than derived from this report alone: what is open is a question
+        // about every run since the last full one, and this run is only the newest of them.
+        runs.openFindings().ifPresent(open -> metrics.record(report, open));
         if (report.agreed()) {
             // The mode is logged with the counts because it is what they mean. Two
             // deposits checked by a full run is a two-deposit book; two checked by an

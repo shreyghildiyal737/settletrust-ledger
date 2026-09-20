@@ -21,6 +21,14 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: settletrust-ledger
+      # The annotation form rather than a ServiceMonitor, because a ServiceMonitor needs
+      # the Prometheus operator installed and this manifest should apply to a cluster that
+      # has nothing in it yet. A cluster running the operator ignores these and is given a
+      # ServiceMonitor instead.
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /actuator/prometheus
+        prometheus.io/port: "8080"
     spec:
       securityContext:
         runAsNonRoot: true

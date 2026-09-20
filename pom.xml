@@ -58,10 +58,20 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
-    <!-- Only for the health endpoints the container probes read. -->
+    <!-- The health endpoints the container probes read, and the metrics an alert reads. -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+    <!--
+      Prometheus rather than a push client. The service exposes what it knows and
+      something else decides what is worth waking somebody for; a service that pushes
+      alerts has to be told where, and then that address is configuration nobody can
+      change without a deployment.
+    -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
     </dependency>
 
     <dependency>

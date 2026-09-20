@@ -66,10 +66,18 @@ management:
   endpoints:
     web:
       exposure:
-        # Health only. Everything else actuator can expose is either useless to an
-        # orchestrator or something that should not be reachable from inside the cluster
-        # without a reason.
-        include: health
+        # Health for the orchestrator, metrics for whatever decides what is worth an
+        # alert. Everything else actuator can expose is either useless to both or
+        # something that should not be reachable from inside the cluster without a reason.
+        include: health,prometheus
+  prometheus:
+    metrics:
+      export:
+        # Stated rather than left to the default, which resolves false here: without this
+        # the registry is never built, the scrape endpoint 404s, and every alert written
+        # against these names silently never fires. A rule that cannot fire looks exactly
+        # like a rule that is passing.
+        enabled: true
   endpoint:
     health:
       probes:

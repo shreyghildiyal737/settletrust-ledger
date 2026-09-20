@@ -460,6 +460,58 @@ because it is that evidence read differently.
 Nothing reconciled yet answers 404 rather than an empty list. "No open findings" and
 "nobody has looked" must not read alike.
 
+### What to alert on
+
+`GET /actuator/prometheus`. The service publishes what it knows and something else decides
+what is worth waking somebody for, which is why there is no push client here: a service
+that sends its own alerts has to be told where, and that address then becomes
+configuration nobody can change without a deployment.
+
+Two series carry the whole story, and they are only useful together:
+
+```
+settletrust_reconciliation_open_findings          how much is wrong
+settletrust_reconciliation_full_run_age_seconds   whether anyone has looked recently
+```
+
+```yaml
+- alert: LedgerDiscrepancy
+  expr: settletrust_reconciliation_open_findings > 0
+  for: 5m
+
+# The one that matters more. A reconciler that has stopped leaves the first metric
+# frozen at a plausible zero, and nothing else gives it away.
+- alert: LedgerNotReconciled
+  expr: settletrust_reconciliation_full_run_age_seconds > 172800
+        or absent(settletrust_reconciliation_full_run_age_seconds)
+  for: 15m
+```
+
+The chain rail has the same pair: `settletrust_chain_head_block` for where it has read to,
+and `settletrust_chain_pass_age_seconds` for whether it is still reading, because a
+stopped watcher leaves every other number frozen at something believable. Counters explain
+the gauges rather than replacing them: `settletrust_chain_deposits_total` by outcome,
+where a reversal rate that is not near zero means the confirmation depth is set too
+shallow for the chain it is pointed at, and `settletrust_reconciliation_runs_total` by
+mode and outcome.
+
+**Unknown is NaN, never zero.** Before the first run there is no answer, and zero open
+findings is an answer. Prometheus keeps NaN and no `> 0` rule fires on it, so the gap is
+covered by the staleness rule and its `absent()` arm instead.
+
+**No gauge reads the database when it is scraped.** A scrape happens every few seconds and
+a reconciliation run every fifteen minutes, so a gauge backed by a query would run it
+hundreds of times between changes to its own value and turn the monitoring system into a
+load generator. The values are held in memory, read once at startup so a restart does not
+blank them, and updated by the runs themselves.
+
+One trap worth recording, because it fails silently: metrics export has to be switched on
+explicitly. Left to its default in this setup the registry is never built, `/actuator/prometheus`
+404s, and every rule written against these names never fires, which from a dashboard
+looks exactly like a system with nothing wrong. `MetricsApiTest` asserts the series are
+published, and asserts that adding them exposed nothing else: the actuator endpoints that
+dump the environment, list the beans or shut the service down are still absent.
+
 **Nothing here repairs anything.** A reconciler that silently corrects what it finds
 destroys the evidence of how the books came to be wrong, and the second occurrence then
 looks like the first.
@@ -506,6 +558,7 @@ at.
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
 | `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `mode` and `reservesChecked` saying what it covered and whether the chain was asked. `?deep=true` re-derives the whole book instead of the window since the last run, which is what to reach for in an incident. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
+| `GET /actuator/prometheus` | The metrics above. |
 | `GET /api/v1/reconciliation/findings/open` | What is still wrong, anchored on the last full run, with each finding's first and last sighting. The endpoint an alert should point at: `runs/latest` answers for a window. 404 when nothing has ever been reconciled, which is not the same as nothing being wrong. |
 
 ```http
@@ -706,6 +759,9 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 | `deep=true` re-derives the book rather than the window | same |
 | The open findings say what they are anchored on | same |
+| The two numbers worth alerting on are published, under the names a rule uses | `MetricsApiTest` |
+| Exposing metrics did not expose anything else | same |
+| The probes still answer, and still differ from each other | same |
 
 ```bash
 mvn test
@@ -733,10 +789,12 @@ deployed, driven end to end against a local node and given its own suite; it has
 been on a public network and has **not been audited**, which is a different and larger
 claim than "the tests pass".
 
-**Next:** the open findings are readable and nothing pushes them. An operator still has
-to poll an endpoint to learn that money has gone missing, which is the wrong way round.
-Somewhere to send them is the next piece, and choosing it is a question about how this
-would actually be run rather than about the ledger.
+**Next:** the alerting rules above are written down and have never fired in anger,
+because nothing has run long enough to go wrong on its own. What would make them real is a
+soak: this service against a chain and a database for a week, with faults injected on
+purpose, to find out whether the thresholds are the right ones. That is a question about
+how it behaves over time rather than about whether it is correct, and it is the one this
+repository cannot answer by reading.
 
 Two things are worth saying plainly rather than leaving to be discovered. The Kubernetes
 manifests are verified with `kubeconform` and the probe split was tested against a
