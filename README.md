@@ -789,12 +789,52 @@ deployed, driven end to end against a local node and given its own suite; it has
 been on a public network and has **not been audited**, which is a different and larger
 claim than "the tests pass".
 
-**Next:** the alerting rules above are written down and have never fired in anger,
-because nothing has run long enough to go wrong on its own. What would make them real is a
-soak: this service against a chain and a database for a week, with faults injected on
-purpose, to find out whether the thresholds are the right ones. That is a question about
-how it behaves over time rather than about whether it is correct, and it is the one this
-repository cannot answer by reading.
+### Run against on a real chain, once, on purpose
+
+The suite proves the parts. It does not prove that the assembled service starts, reads a
+chain it was pointed at by configuration, and reports what it found, so that was done by
+hand against Postgres and a local anvil, with faults injected to see the detection work
+rather than to see the tests pass.
+
+What it showed, in order: the service migrated a fresh schema and began reconciling with
+`reservesChecked: true`, because a node was configured. An invoice opened over HTTP and
+walked to `escrow_pending`. A deposit paid on chain was credited within one poll and the
+invoice became `escrow_funded`; the id the contract carried,
+`0x696e762d736d6f6b65303100…`, is what `cast format-bytes32-string` produces, which is an
+independent implementation of the same encoding agreeing with `InvoiceRef`. The escrow
+held 2,500,000 and `chain:USDC` held its negative, and a deep run agreed.
+
+Then the settler released the escrow on chain while the ledger still believed it held the
+money. The next run reported `RESERVES_SHORT chain:USDC: the ledger has credited 2500000
+USDC out of a contract holding 0 USDC`, which is the one finding no amount of
+cross-checking our own records could have produced.
+
+Then a stray entry was written straight into the database, and the two runs after it are
+the whole watermark design in two log lines. The window containing it reported
+`ENTRIES_DO_NOT_SUM_TO_ZERO` and `TRANSFER_NOT_BALANCED: 3 entries netting 1 minor units`,
+which is the windowed check choosing the transfer and then reading the whole group rather
+than the one row that arrived late. The next window reported the first and not the second:
+the fold still speaks for the whole book, and the check that names one transfer had no new
+transfer to name.
+
+Which is exactly the case `findings/open` exists for, and it is worth seeing the two
+answers side by side:
+
+```
+GET /runs/latest       2 discrepancies   ENTRIES_DO_NOT_SUM_TO_ZERO, RESERVES_SHORT
+GET /findings/open     3 open            + TRANSFER_NOT_BALANCED, seen once, still wrong
+```
+
+An alert pointed at the latest report would have missed the unbalanced transfer entirely.
+`settletrust_reconciliation_open_findings` read `3.0` throughout, so the rule in the
+previous section fires on it. No unexpected warning or error appeared in the log across
+the whole run.
+
+**Next:** those rules have now fired against faults put there on purpose, which says the
+wiring is right and says nothing about the thresholds. What would settle those is a soak:
+this service against a chain and a database for a week, finding out how often a quiet
+system trips them on its own. That is a question about behaviour over time rather than
+about correctness, and it is the one this repository cannot answer by reading.
 
 Two things are worth saying plainly rather than leaving to be discovered. The Kubernetes
 manifests are verified with `kubeconform` and the probe split was tested against a
