@@ -72,4 +72,17 @@ class ReconciliationApiTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.runId", is(runId)));
     }
+
+    @Test
+    @DisplayName("deep=true re-derives the book rather than the window since the last run")
+    void aDeepRunCanBeDemanded() throws Exception {
+        // One run first, so there is a watermark an ordinary run would have continued from
+        // and the flag has something to override.
+        mvc.perform(post("/api/v1/reconciliation/runs")).andExpect(status().isCreated());
+
+        mvc.perform(post("/api/v1/reconciliation/runs").param("deep", "true"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.mode", is("FULL")))
+                .andExpect(jsonPath("$.checkedFrom", is(0)));
+    }
 }

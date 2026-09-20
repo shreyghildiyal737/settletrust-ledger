@@ -18,10 +18,16 @@ import java.util.UUID;
  * chain. A deployment with no node configured still produces clean reports, and without
  * this flag they would look exactly like reports that had verified the money was really
  * there.
+ *
+ * <p>{@code range} is the third thing that qualifies the verdict, and it changes what the
+ * counts mean. A {@link RunMode#FULL} run counts the book; an {@link RunMode#INCREMENTAL}
+ * one counts its window, where zero observations is the normal state of a quiet chain
+ * rather than a stopped watcher. Read the counts through the mode or do not read them.
  */
 public record ReconciliationReport(
         UUID runId,
         Instant ranAt,
+        CheckedRange range,
         int observationsChecked,
         int transfersChecked,
         boolean reservesChecked,
@@ -30,6 +36,7 @@ public record ReconciliationReport(
     public ReconciliationReport {
         Objects.requireNonNull(runId, "runId must not be null");
         Objects.requireNonNull(ranAt, "ranAt must not be null");
+        Objects.requireNonNull(range, "range must not be null");
         discrepancies = List.copyOf(discrepancies);
     }
 
@@ -37,10 +44,14 @@ public record ReconciliationReport(
      * True when everything this run looked at agreed.
      *
      * <p>Deliberately says nothing about what was looked at. Read it next to
-     * {@link #reservesChecked()} and the counts, never on its own.
+     * {@link #reservesChecked()}, {@link #range()} and the counts, never on its own.
      */
     public boolean agreed() {
         return discrepancies.isEmpty();
+    }
+
+    public RunMode mode() {
+        return range.mode();
     }
 
     public List<Discrepancy> of(DiscrepancyKind kind) {

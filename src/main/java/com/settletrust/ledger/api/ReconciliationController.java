@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import static com.settletrust.ledger.api.ReconciliationDtos.ReportView;
@@ -39,10 +40,15 @@ class ReconciliationController {
      * <p>409 is the one other answer, and it means something different: another instance
      * holds the lease, so no run happened at all. Retrying that one is reasonable, which
      * is exactly why it must not share a status code with a run that found problems.
+     *
+     * <p>{@code ?deep=true} re-derives the whole book instead of reconciling the window
+     * since the last run. It is what to reach for in an incident: the scheduled runs
+     * answer for the last few minutes, and the question in an incident is never about the
+     * last few minutes. It costs a full scan, which is why it is not the default.
      */
     @PostMapping("/runs")
-    ResponseEntity<ReportView> runNow() {
-        return reconciler.run()
+    ResponseEntity<ReportView> runNow(@RequestParam(defaultValue = "false") boolean deep) {
+        return (deep ? reconciler.runFully() : reconciler.run())
                 .map(report -> ResponseEntity.status(HttpStatus.CREATED).body(ReportView.of(report)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.CONFLICT).build());
     }

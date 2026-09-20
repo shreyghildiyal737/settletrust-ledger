@@ -212,6 +212,7 @@ which is the more expensive of the two.
 | `chain:<currency>` equals the negative of what the chain confirmed | Anything that touched the chain account outside the watcher |
 | No customer account is negative | A row lock that did not serialise what it was supposed to |
 | The escrow contract holds at least what the ledger credited out of it | A watcher that misread the chain, and every check above agreeing with it |
+| The totals a run carries forward are what the entries actually say | A fold that drifted, or history rewritten below the watermark |
 
 The sixth is the aggregate check, deliberately computed from the opposite end of the data
 to the per-deposit ones. When both fire on the same fault they corroborate each other;
@@ -256,8 +257,68 @@ reconciler, because it teaches an operator to close the alert without reading it
 `serializable`: that protects against write skew, and this writes nothing the checks read.
 
 The cost is an open snapshot for the length of the run, which holds vacuum back on a large
-book. That is one of the reasons the next version reconciles from a watermark rather than
-scanning everything.
+book, which is why most runs no longer read the whole book at all.
+
+### Reconciling from a watermark
+
+Scanning everything every fifteen minutes is correct and does not scale, so a run normally
+looks only at the transactions committed since the last one. The entire difficulty is in
+saying what *since* means.
+
+**It cannot mean an id or a timestamp.** Both are chosen by the row while its transaction
+is still open, and transactions do not commit in the order they started: a transfer that
+takes sequence value 100 can commit after one that took 101. A run that marks itself at
+101 has already passed 100 by the time it lands, and the gap is permanent and silent.
+That is the worst failure a reconciler can have, because every symptom of it is a clean
+report.
+
+So the mark is on visibility instead. Every append-only row records the id of the
+transaction that wrote it, and a run's new mark is `pg_snapshot_xmin`: the oldest
+transaction still in flight when the run took its snapshot. Nothing below that can still
+arrive, because a transaction is given its id when it first writes and one that has not
+written yet will be given a higher one. Consecutive windows therefore tile the history
+with no row seen twice and none skipped.
+
+The failure mode is the right way round, too. A long-running transaction anywhere in the
+database pins `xmin`, the mark stops advancing, and the run does *less work* rather than
+missing work. `xid8` rather than `xid`: 64 bits, so it does not wrap and two of them can
+be compared without knowing where the counter currently sits.
+
+**Which checks may use the window is decided by the data.** The rule is that only what
+cannot change may be skipped:
+
+| | Treatment | Why |
+|---|---|---|
+| Sums over `entry` | Folded: window sum plus the previous run's total | An entry is written once and never revised, so a window sum is a true delta |
+| Checks that name one subject | The window picks which subjects to look at; each is then read in full | An account nothing was posted to cannot newly be overdrawn; a transfer nothing was posted to cannot newly be unbalanced |
+| Aggregates over `chain_observation` | Not windowed at all | That table is a cursor over a chain that changes its mind, and leaving a mutated row out of a sum does not remove what it used to contribute |
+
+An observation that *does* change is restamped by a trigger and falls back inside the next
+window, which is what keeps the per-deposit checks honest across a reorg: a deposit
+reversed long after it was last examined comes back under its new status.
+
+Because the net is folded rather than re-queried, an incremental run still answers for the
+whole book. A window with nothing in it does not report a clean net; it reports the net
+the book has.
+
+**The fold is the one thing here that trusts a number this service wrote, and it is
+trusted on one condition.** Every other check in this file goes out of its way to compare
+two independent sources, and a carried total is neither. A figure that went wrong once
+would be carried forward by every run after it, each agreeing with the last and none
+looking at the entries again. So a full run comes round on a timer, re-derives the same
+totals from the entries at exactly the mark the earlier run stopped at, and raises
+`CHECKPOINT_DRIFT` when they part company. That catches both a bug in the arithmetic and a
+rewrite of history below the watermark, which the append-only triggers are supposed to
+make impossible and this is how anyone would find out they had not. The entry count is
+folded alongside the net, because two errors in opposite directions leave a net untouched
+and both of them change the count behind it.
+
+The mode and the window are stored with every report, because they change what the counts
+mean. Two deposits checked by a full run is a two-deposit book; two checked by an
+incremental one is two deposits since the last tick, and says nothing about the rest. The
+one thing an incremental run cannot do is notice a fault in history it has already passed,
+so "the last run was clean" is a statement about a window. Only the last full run is a
+statement about the ledger.
 
 **Nothing here repairs anything.** A reconciler that silently corrects what it finds
 destroys the evidence of how the books came to be wrong, and the second occurrence then
@@ -303,7 +364,7 @@ at.
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
 | `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
-| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `reservesChecked` saying whether the chain was asked. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
+| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `mode` and `reservesChecked` saying what it covered and whether the chain was asked. `?deep=true` re-derives the whole book instead of the window since the last run, which is what to reach for in an incident. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
 
 ```http
@@ -461,11 +522,20 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | Money in the contract that nothing explains is raised as a question | same |
 | With no chain to ask, the report says so rather than reading as verified | same |
 | A second instance finds the lease taken and writes no duplicate report | same |
+| The first run is deep, and the next one continues where it stopped | `ReconcilerTest.FromAWatermark` |
+| A deep run comes round again once the last one has aged out | same |
+| A book that was already wrong stays wrong in the eyes of an empty window | same |
+| An entry added after a clean run pulls its whole transfer back into view | same |
+| An account driven negative after a clean run is caught by the window | same |
+| A deposit reversed after it was checked is examined again | same |
+| A carried total the entries do not support is itself a finding | same |
+| A transaction that commits out of order is not passed over | same |
 | A status is final exactly when it has nowhere left to go | `InvoiceLifecycleSpec` |
 | Every status is reachable from a draft, so none is stranded | same |
 | Each illegal move carries the reason it deserves, across nine cases | same |
 | Each status reports exactly what it is waiting on, across eleven | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
+| `deep=true` re-derives the book rather than the window | same |
 
 ```bash
 mvn test
@@ -486,8 +556,8 @@ mvn test
 
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
 generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
-settlement, the on-chain deposit rail with its reorg handling, reconciliation and its
-schedule, and the tests above. The escrow contract is written but not yet deployed or run
+settlement, the on-chain deposit rail with its reorg handling, reconciliation from a
+watermark with its periodic full sweep, the schedule and lease, and the tests above. The escrow contract is written but not yet deployed or run
 against a node, so the reserve check has a port and a fake and no live implementation:
 every report this service produces today says `reservesChecked: false`, and means it.
 
@@ -496,7 +566,9 @@ every report this service produces today says `reservesChecked: false`, and mean
 1. A `ChainSource` and an `EscrowReserves` backed by a real Ethereum client, with the
    contract deployed to a local chain. One piece of work now, since the reserve check is
    the thing that most needs a real node and the port it needs is already there.
-2. Reconciliation from a watermark with a periodic full sweep, so the snapshot is not held
-   open across the whole book.
+2. A findings feed an operator can subscribe to. Runs and findings are stored and
+   readable one at a time; what is missing is "what is open right now", which an
+   incremental run cannot answer on its own because a fault it reported once and nobody
+   fixed does not reappear in later windows.
 
 One ledger, two settlement rails.

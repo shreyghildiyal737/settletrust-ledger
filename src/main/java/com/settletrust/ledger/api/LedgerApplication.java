@@ -14,11 +14,13 @@ import org.jooq.impl.DSL;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.scheduling.annotation.EnableScheduling;
 
 import javax.sql.DataSource;
 import java.time.Clock;
+import java.time.Duration;
 
 /**
  * The application, and the only place the domain is wired to anything.
@@ -84,8 +86,9 @@ public class LedgerApplication {
             DSLContext dsl,
             Clock clock,
             PostgresReconciliationRuns runs,
-            ObjectProvider<EscrowReserves> reserves) {
-        return new Reconciler(dsl, clock, runs, reserves.getIfAvailable());
+            ObjectProvider<EscrowReserves> reserves,
+            @Value("${ledger.reconciliation.deep-interval:PT24H}") Duration deepInterval) {
+        return new Reconciler(dsl, clock, runs, reserves.getIfAvailable(), deepInterval);
     }
 
     @Bean

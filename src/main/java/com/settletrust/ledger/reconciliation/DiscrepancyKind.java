@@ -66,5 +66,21 @@ public enum DiscrepancyKind {
      * contract address by someone skipping the flow land here, and so does an event the
      * watcher never saw, which is a failure nothing else in this reconciler detects.
      */
-    RESERVES_UNACCOUNTED
+    RESERVES_UNACCOUNTED,
+
+    /**
+     * The total an incremental run has been carrying forward is not what the entries say.
+     *
+     * <p>Only a full run can raise this, and raising it is most of why full runs still
+     * happen. An incremental run adds the window's entries to a figure a previous run
+     * wrote down, so it never looks at history again; if that figure is wrong, every run
+     * after it agrees with itself forever. The full run re-derives the same total from
+     * the entries and says so when they part company.
+     *
+     * <p>Two faults produce it. One is arithmetic: a bug in the fold, or a window that
+     * missed or double-counted a row. The other is worse: history below the watermark
+     * changed after it was checked, which the append-only triggers are supposed to make
+     * impossible and this is how anyone would find out they had not.
+     */
+    CHECKPOINT_DRIFT
 }

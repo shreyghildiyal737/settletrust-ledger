@@ -5,6 +5,8 @@ import com.settletrust.ledger.chain.EscrowReserves;
 import com.settletrust.ledger.chain.ObservationStatus;
 import com.settletrust.ledger.settlement.InvoiceSettlement;
 import com.settletrust.ledger.settlement.SettlementKeys;
+import org.jooq.Condition;
+import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.Field;
 import org.jooq.Record;
@@ -13,6 +15,7 @@ import org.jooq.impl.DSL;
 
 import java.math.BigDecimal;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -20,6 +23,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
 
@@ -46,6 +50,34 @@ import static com.settletrust.ledger.jooq.Tables.TRANSFER;
  * <p>Nothing here repairs anything. A reconciler that silently corrects what it finds
  * destroys the evidence of how the books came to be wrong, and the second occurrence then
  * looks like the first.
+ *
+ * <h2>Why most runs no longer read the whole book</h2>
+ *
+ * <p>Scanning everything every fifteen minutes is correct and does not scale, so a run
+ * normally looks only at the window of transactions since the last one and adds its
+ * findings to totals the previous run wrote down. {@link CheckedRange} explains how the
+ * window is chosen and why it is bounded by transaction visibility rather than by an id
+ * or a timestamp.
+ *
+ * <p>Which checks may use the window at all is decided by the data, not by convenience,
+ * and the rule is that <b>only what cannot change may be skipped</b>:
+ *
+ * <ul>
+ *   <li>Sums over {@code entry} are folded, because an entry is written once and never
+ *       revised, so a window sum is a true delta.
+ *   <li>Checks whose finding names one subject use the window only to choose which
+ *       subjects to look at, and then read each one in full. An account with no new
+ *       entries cannot newly be overdrawn; a transfer with no new entries cannot newly be
+ *       unbalanced.
+ *   <li>Aggregates over {@code chain_observation} are not windowed at all. That table is
+ *       a cursor over a chain that changes its mind, and leaving a mutated row out of a
+ *       sum does not remove what it used to contribute, so a fold over it would drift
+ *       away from the truth with nothing to notice.
+ * </ul>
+ *
+ * <p>An observation that does change is restamped by a trigger and falls back inside the
+ * next window, which is what keeps the subject-by-subject deposit checks honest across a
+ * reorg.
  */
 public class Reconciler {
 
@@ -58,10 +90,22 @@ public class Reconciler {
      */
     static final long LEASE_KEY = 6_251_968_311_047_201L;
 
+    /**
+     * How stale the last full pass may get before the next run goes deep.
+     *
+     * <p>A day, because the deep run is what makes every incremental verdict in between
+     * worth anything: it is the only run that re-derives the carried totals and the only
+     * one that can see a fault in history the windows have already passed. Shorter costs
+     * a full scan more often than a large book can afford; much longer leaves a window of
+     * time in which a silent rewrite is nobody's finding.
+     */
+    private static final Duration DEFAULT_DEEP_INTERVAL = Duration.ofHours(24);
+
     private final DSLContext dsl;
     private final Clock clock;
     private final PostgresReconciliationRuns runs;
     private final EscrowReserves reserves;
+    private final Duration deepInterval;
 
     /** Without a chain to ask, so every check compares our own records against each other. */
     public Reconciler(DSLContext dsl, Clock clock, PostgresReconciliationRuns runs) {
@@ -76,10 +120,40 @@ public class Reconciler {
      */
     public Reconciler(
             DSLContext dsl, Clock clock, PostgresReconciliationRuns runs, EscrowReserves reserves) {
+        this(dsl, clock, runs, reserves, DEFAULT_DEEP_INTERVAL);
+    }
+
+    public Reconciler(
+            DSLContext dsl,
+            Clock clock,
+            PostgresReconciliationRuns runs,
+            EscrowReserves reserves,
+            Duration deepInterval) {
+
         this.dsl = Objects.requireNonNull(dsl, "dsl must not be null");
         this.clock = Objects.requireNonNull(clock, "clock must not be null");
         this.runs = Objects.requireNonNull(runs, "runs must not be null");
         this.reserves = reserves;
+        this.deepInterval = Objects.requireNonNull(deepInterval, "deepInterval must not be null");
+    }
+
+    /**
+     * Reconciles, choosing for itself whether the book needs re-deriving or the window
+     * will do. This is what the schedule calls.
+     */
+    public Optional<ReconciliationReport> run() {
+        return reconcile(false);
+    }
+
+    /**
+     * Reconciles the whole book, whatever the schedule would have chosen.
+     *
+     * <p>What an operator wants during an incident. An incremental report is an answer
+     * about the last few minutes, and the question in an incident is always about the
+     * book.
+     */
+    public Optional<ReconciliationReport> runFully() {
+        return reconcile(true);
     }
 
     /**
@@ -99,9 +173,9 @@ public class Reconciler {
      * writes nothing the checks read. It would only add predicate locking and
      * serialisation failures to a read-only pass.
      *
-     * <p>The cost is an open snapshot for the length of the run, which holds back vacuum
-     * on a large book. That is one of the reasons the next version of this reconciles
-     * from a watermark rather than scanning everything.
+     * <p>The cost is an open snapshot for the length of the run, which holds back vacuum.
+     * That is now bounded by the window rather than by the size of the book, except on
+     * the deep run, which pays the old price deliberately and once a day.
      *
      * <p><b>Empty means somebody else is already reconciling.</b> Two instances against
      * one database would otherwise both scan the book and both write a report of the same
@@ -113,8 +187,11 @@ public class Reconciler {
      * that dies mid-run loses its connection, Postgres ends the transaction, and the lock
      * is gone with it. A lease held in a table has to be given an expiry, and choosing
      * that expiry means guessing how long a run takes on a book you have not seen yet.
+     *
+     * <p>The lease is also what makes the watermark safe to advance: only one run reads
+     * the previous mark and writes the next one, so the marks cannot interleave.
      */
-    public Optional<ReconciliationReport> run() {
+    private Optional<ReconciliationReport> reconcile(boolean deepRegardless) {
         return dsl.transactionResult(config -> {
             DSLContext snapshot = DSL.using(config);
             // Must be the first statement in the transaction, and it is: jOOQ has issued
@@ -125,17 +202,22 @@ public class Reconciler {
                 return Optional.<ReconciliationReport>empty();
             }
 
+            Optional<Carried> carried = runs.carriedFrom(config);
+            CheckedRange range = rangeFor(config, carried, horizonOf(snapshot), deepRegardless);
+
             List<Discrepancy> found = new ArrayList<>();
 
-            found.addAll(currenciesThatDoNotNetToZero(snapshot));
-            found.addAll(transfersThatAreNotBalancedPairs(snapshot));
+            Nets nets = netsByCurrency(snapshot, range, carried);
+            found.addAll(nets.discrepancies());
 
-            Deposits deposits = depositsAgainstTheLedger(snapshot);
+            found.addAll(transfersThatAreNotBalancedPairs(snapshot, range));
+
+            Deposits deposits = depositsAgainstTheLedger(snapshot, range);
             found.addAll(deposits.discrepancies());
 
-            found.addAll(creditsWithNoConfirmedDepositBehindThem(snapshot));
+            found.addAll(creditsWithNoConfirmedDepositBehindThem(snapshot, range));
             found.addAll(chainAccountsAgainstWhatTheChainSent(snapshot));
-            found.addAll(overdrawnCustomerAccounts(snapshot));
+            found.addAll(overdrawnCustomerAccounts(snapshot, range));
 
             // Last, and outside the snapshot of necessity, because the chain has no
             // snapshot to join. See reservesAgainstTheChain for why the order matters.
@@ -144,16 +226,60 @@ public class Reconciler {
             ReconciliationReport report = new ReconciliationReport(
                     UUID.randomUUID(),
                     clock.instant(),
+                    range,
                     deposits.checked(),
-                    countOfTransfers(snapshot),
+                    transfersIn(snapshot, range),
                     reserves != null,
                     found);
 
-            // Written inside the same transaction, so the report lands with the snapshot
-            // it describes rather than alongside a database that has moved on.
-            runs.recordWithin(config, report);
+            // Written inside the same transaction, so the report and the totals the next
+            // run will build on land with the snapshot they describe rather than
+            // alongside a database that has moved on.
+            runs.recordWithin(config, report, nets.carryForward());
             return Optional.of(report);
         });
+    }
+
+    /**
+     * How much of the book this run answers for.
+     *
+     * <p>Deep when asked to be, when there is nothing to carry forward, and when the last
+     * deep run has aged out. Otherwise the window runs from where the last one stopped.
+     */
+    private CheckedRange rangeFor(
+            Configuration config, Optional<Carried> carried, long horizon, boolean deepRegardless) {
+
+        if (deepRegardless || carried.isEmpty() || deepRunIsDue(config)) {
+            return CheckedRange.everything(horizon);
+        }
+
+        long from = carried.get().checkedThrough();
+        // The mark never moves backwards. It can fail to move forwards, because a
+        // long-running transaction anywhere in the database holds xmin down, and an empty
+        // window is a perfectly good answer: the run does less work rather than skipping
+        // any. A window running backwards would not be an answer at all.
+        return CheckedRange.since(from, Math.max(horizon, from));
+    }
+
+    private boolean deepRunIsDue(Configuration config) {
+        return runs.lastFullRun(config)
+                .map(last -> !last.isAfter(clock.instant().minus(deepInterval)))
+                .orElse(true);
+    }
+
+    /**
+     * The point below which no transaction can still arrive.
+     *
+     * <p>{@code pg_snapshot_xmin} is the oldest transaction still in flight when this
+     * transaction took its snapshot. Every transaction below it has already been decided,
+     * and every transaction that has not yet written will be given an id above it, so a
+     * window ending here can never be reopened by a late commit.
+     */
+    private static long horizonOf(DSLContext snapshot) {
+        return snapshot
+                .select(DSL.field(
+                        "pg_snapshot_xmin(pg_current_snapshot())::text::bigint", Long.class))
+                .fetchOne(0, Long.class);
     }
 
     /**
@@ -167,30 +293,111 @@ public class Reconciler {
                 .fetchOne(0, Boolean.class));
     }
 
+    /** The totals this run leaves for the next one, and what they said about this one. */
+    private record Nets(Map<String, Carried.Total> carryForward, List<Discrepancy> discrepancies) {
+    }
+
     /**
      * The oldest check in accounting: every entry in a currency must net to zero.
      *
      * <p>It is cheap and it subsumes a great deal. Any single-sided write, any half-posted
      * transfer and any entry inserted by hand shows up here, whatever produced it.
+     *
+     * <p>It is also the check that folds. An incremental run sums the window and adds the
+     * previous run's figure, so the verdict is still about the whole book even though the
+     * query read a few minutes of it. That is only sound because an entry never changes
+     * after it is written, and it is only trustworthy because a deep run re-derives the
+     * carried figure and reports {@link DiscrepancyKind#CHECKPOINT_DRIFT} if it has come
+     * adrift.
      */
-    private List<Discrepancy> currenciesThatDoNotNetToZero(DSLContext snapshot) {
-        Field<BigDecimal> net = DSL.sum(ENTRY.AMOUNT_MINOR);
+    private Nets netsByCurrency(
+            DSLContext snapshot, CheckedRange range, Optional<Carried> carried) {
 
-        return snapshot.select(ENTRY.CURRENCY, net)
+        Map<String, Carried.Total> totals =
+                new TreeMap<>(totalsIn(snapshot, range.covering(ENTRY.XID)));
+
+        if (!range.isFull()) {
+            carried.orElseThrow(() -> new IllegalStateException(
+                            "an incremental run has nothing to carry forward from"))
+                    .totals()
+                    .forEach((currency, carriedTotal) ->
+                            totals.merge(currency, carriedTotal, Carried.Total::plus));
+        }
+
+        List<Discrepancy> found = new ArrayList<>();
+        totals.forEach((currency, total) -> {
+            if (total.netMinor() != 0) {
+                found.add(Discrepancy.mismatch(
+                        DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO,
+                        currency,
+                        "the " + currency + " book does not balance",
+                        Money.zero(currency),
+                        Money.of(total.netMinor(), currency)));
+            }
+        });
+
+        if (range.isFull() && carried.isPresent()) {
+            found.addAll(carriedTotalsAgainstTheEntries(snapshot, carried.get()));
+        }
+
+        return new Nets(totals, found);
+    }
+
+    /**
+     * The deep run's real job: checking the number every run in between has been trusting.
+     *
+     * <p>Re-derives the previous run's totals from the entries themselves, at exactly the
+     * watermark that run stopped at, so the two figures describe the same set of rows and
+     * a difference between them is a difference of substance rather than of timing.
+     *
+     * <p>Without this the fold is a closed loop. A total that went wrong once would be
+     * carried forward by every run after it, each of them agreeing with the last and none
+     * of them looking at the entries again.
+     */
+    private List<Discrepancy> carriedTotalsAgainstTheEntries(DSLContext snapshot, Carried carried) {
+        Map<String, Carried.Total> rederived =
+                totalsIn(snapshot, ENTRY.XID.lt(carried.checkedThrough()));
+
+        Set<String> currencies = new TreeSet<>(rederived.keySet());
+        currencies.addAll(carried.totals().keySet());
+
+        List<Discrepancy> found = new ArrayList<>();
+        for (String currency : currencies) {
+            Carried.Total claimed = carried.of(currency);
+            Carried.Total truth = rederived.getOrDefault(currency, Carried.Total.NOTHING);
+            if (claimed.equals(truth)) {
+                continue;
+            }
+
+            found.add(Discrepancy.mismatch(
+                    DiscrepancyKind.CHECKPOINT_DRIFT,
+                    currency,
+                    "run " + carried.runId() + " carried "
+                            + Money.of(claimed.netMinor(), currency) + " over "
+                            + claimed.entriesCounted() + " entries, and re-reading the same "
+                            + "entries gives " + Money.of(truth.netMinor(), currency) + " over "
+                            + truth.entriesCounted(),
+                    // The entries are the authority. The carried figure is the claim.
+                    Money.of(truth.netMinor(), currency),
+                    Money.of(claimed.netMinor(), currency)));
+        }
+        return found;
+    }
+
+    private static Map<String, Carried.Total> totalsIn(DSLContext snapshot, Condition of) {
+        Field<BigDecimal> net = DSL.sum(ENTRY.AMOUNT_MINOR);
+        Field<Integer> lines = DSL.count();
+
+        Map<String, Carried.Total> totals = new HashMap<>();
+        snapshot.select(ENTRY.CURRENCY, net, lines)
                 .from(ENTRY)
+                .where(of)
                 .groupBy(ENTRY.CURRENCY)
-                .having(net.ne(BigDecimal.ZERO))
                 .fetch()
-                .map(row -> {
-                    String currency = row.get(ENTRY.CURRENCY);
-                    Money drift = Money.of(row.get(net).longValueExact(), currency);
-                    return Discrepancy.mismatch(
-                            DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO,
-                            currency,
-                            "the " + currency + " book does not balance",
-                            Money.zero(currency),
-                            drift);
-                });
+                .forEach(row -> totals.put(
+                        row.get(ENTRY.CURRENCY),
+                        new Carried.Total(row.get(net).longValueExact(), row.get(lines))));
+        return totals;
     }
 
     /**
@@ -200,13 +407,25 @@ public class Reconciler {
      * per-currency check is not enough on its own. The entry count is checked as well as
      * the sum, because three entries netting to zero is a transfer this service has no
      * way of having written.
+     *
+     * <p>The window picks which transfers to look at and nothing more: every entry of a
+     * transfer is written in the transaction that wrote the transfer, so a stray entry
+     * added later carries its own transaction id and drags the transfer it names back
+     * into view. The group is then summed in full, which is what lets the finding say
+     * three entries rather than the one that happened to arrive late.
      */
-    private List<Discrepancy> transfersThatAreNotBalancedPairs(DSLContext snapshot) {
+    private List<Discrepancy> transfersThatAreNotBalancedPairs(
+            DSLContext snapshot, CheckedRange range) {
+
         Field<BigDecimal> net = DSL.sum(ENTRY.AMOUNT_MINOR);
         Field<Integer> lines = DSL.count();
+        com.settletrust.ledger.jooq.tables.Entry touched = ENTRY.as("touched");
 
         return snapshot.select(ENTRY.TRANSFER_ID, net, lines)
                 .from(ENTRY)
+                .where(ENTRY.TRANSFER_ID.in(DSL.select(touched.TRANSFER_ID)
+                        .from(touched)
+                        .where(range.covering(touched.XID))))
                 .groupBy(ENTRY.TRANSFER_ID)
                 .having(net.ne(BigDecimal.ZERO).or(lines.ne(2)))
                 .fetch()
@@ -229,8 +448,13 @@ public class Reconciler {
      * check. Both transfers are outer-joined in one pass: a reversed deposit has to have
      * both the credit that happened and the reversal that undid it, and a reversal
      * standing alone means the ledger is holding money the chain took back.
+     *
+     * <p>The window applies to all three rows, because any of them can be the new one. A
+     * deposit whose status changed is restamped by the trigger and returns here under its
+     * new status; a credit or a reversal written after its observation was last examined
+     * brings the pair back on its own account.
      */
-    private Deposits depositsAgainstTheLedger(DSLContext snapshot) {
+    private Deposits depositsAgainstTheLedger(DSLContext snapshot, CheckedRange range) {
         com.settletrust.ledger.jooq.tables.Transfer credit = TRANSFER.as("credit");
         com.settletrust.ledger.jooq.tables.Transfer reversal = TRANSFER.as("reversal");
 
@@ -242,6 +466,9 @@ public class Reconciler {
                 .on(reversal.IDEMPOTENCY_KEY.eq(keyFor(SettlementKeys.CHAIN_REVERSAL_PREFIX)))
                 .where(CHAIN_OBSERVATION.STATUS.in(
                         ObservationStatus.CONFIRMED.name(), ObservationStatus.REVERSED.name()))
+                .and(range.covering(CHAIN_OBSERVATION.XID)
+                        .or(range.covering(credit.XID))
+                        .or(range.covering(reversal.XID)))
                 .orderBy(CHAIN_OBSERVATION.BLOCK_NUMBER.asc(), CHAIN_OBSERVATION.LOG_INDEX.asc())
                 .fetch();
 
@@ -336,8 +563,14 @@ public class Reconciler {
      * <p>A pending or abandoned observation counts as not vouching for it. Those deposits
      * are ones the watcher has seen and deliberately not acted on, so a transfer carrying
      * their key means something moved money the watcher had decided not to trust yet.
+     *
+     * <p>Windowed from either side, and the observation side is the one that matters: a
+     * deposit demoted from confirmed back to pending is restamped, so the credit that was
+     * legitimate when it was last examined comes back under its new circumstances.
      */
-    private List<Discrepancy> creditsWithNoConfirmedDepositBehindThem(DSLContext snapshot) {
+    private List<Discrepancy> creditsWithNoConfirmedDepositBehindThem(
+            DSLContext snapshot, CheckedRange range) {
+
         return snapshot.select(TRANSFER.IDEMPOTENCY_KEY, TRANSFER.AMOUNT_MINOR, TRANSFER.CURRENCY,
                         CHAIN_OBSERVATION.STATUS)
                 .from(TRANSFER)
@@ -348,6 +581,8 @@ public class Reconciler {
                         .or(CHAIN_OBSERVATION.STATUS.notIn(
                                 ObservationStatus.CONFIRMED.name(),
                                 ObservationStatus.REVERSED.name())))
+                .and(range.covering(TRANSFER.XID)
+                        .or(range.covering(CHAIN_OBSERVATION.XID)))
                 .fetch()
                 .map(row -> {
                     String status = row.get(CHAIN_OBSERVATION.STATUS);
@@ -374,6 +609,15 @@ public class Reconciler {
      * independent second source: the observations themselves. Reversed deposits cancel
      * out, since the reversal pays back into the same account, so only confirmed ones
      * count.
+     *
+     * <p><b>Not windowed, on either side, deliberately.</b> One side aggregates
+     * {@code chain_observation}, where a row that leaves the window has not stopped
+     * contributing to the total it was counted in, so no fold over it is sound. Leaving
+     * the ledger side windowed while the chain side was not would be worse still: the two
+     * halves would be answering about different sets of deposits, and the difference
+     * between them would be arithmetic rather than a fault. Both sides scan, and the
+     * table they scan is bounded by how often the chain pays rather than by how much the
+     * ledger has ever done.
      */
     private List<Discrepancy> chainAccountsAgainstWhatTheChainSent(DSLContext snapshot) {
         Map<String, Long> confirmedByCurrency = new HashMap<>();
@@ -423,14 +667,23 @@ public class Reconciler {
      * day. If a customer account has gone below zero, the lock that was supposed to
      * serialise its spending did not, and no amount of re-reading the transfer code will
      * show that.
+     *
+     * <p>The window chooses the accounts and the balance is still summed over every entry
+     * they have. An account nothing was posted to cannot have changed its balance, so
+     * skipping it costs nothing; summing only the window's entries would have reported
+     * every account that happened to pay money out this quarter of an hour.
      */
-    private List<Discrepancy> overdrawnCustomerAccounts(DSLContext snapshot) {
+    private List<Discrepancy> overdrawnCustomerAccounts(DSLContext snapshot, CheckedRange range) {
         Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
+        com.settletrust.ledger.jooq.tables.Entry touched = ENTRY.as("touched");
 
         return snapshot.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
                 .from(ACCOUNT)
                 .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
                 .where(ACCOUNT.KIND.eq("CUSTOMER"))
+                .and(ACCOUNT.ID.in(DSL.select(touched.ACCOUNT_ID)
+                        .from(touched)
+                        .where(range.covering(touched.XID))))
                 .groupBy(ACCOUNT.ID, ACCOUNT.CURRENCY)
                 .having(balance.lt(BigDecimal.ZERO))
                 .fetch()
@@ -473,6 +726,9 @@ public class Reconciler {
      * shows up in the chain balance and not in the ledger, which inflates the surplus and
      * can never manufacture a shortfall. The timing artefact lands on the finding that
      * tolerates one, and the alarming finding stays true whenever it fires.
+     *
+     * <p><b>Not windowed.</b> The contract reports what it holds now, in total; there is
+     * no such thing as asking it for the window. The ledger side is left whole to match.
      */
     private List<Discrepancy> reservesAgainstTheChain(DSLContext snapshot) {
         if (reserves == null) {
@@ -540,8 +796,9 @@ public class Reconciler {
         return found;
     }
 
-    private static int countOfTransfers(DSLContext snapshot) {
-        return snapshot.fetchCount(TRANSFER);
+    /** How many transfers fell in this run's window, which on a deep run is all of them. */
+    private static int transfersIn(DSLContext snapshot, CheckedRange range) {
+        return snapshot.fetchCount(TRANSFER, range.covering(TRANSFER.XID));
     }
 
     /**

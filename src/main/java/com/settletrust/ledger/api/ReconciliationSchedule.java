@@ -57,15 +57,20 @@ class ReconciliationSchedule {
 
         ReconciliationReport report = completed.get();
         if (report.agreed()) {
-            log.info("Reconciliation {} clean: {} deposits and {} transfers checked, "
+            // The mode is logged with the counts because it is what they mean. Two
+            // deposits checked by a full run is a two-deposit book; two checked by an
+            // incremental one is two deposits since the last tick and says nothing at all
+            // about the rest.
+            log.info("Reconciliation {} clean ({}): {} deposits and {} transfers checked, "
                             + "reserves {}",
-                    report.runId(), report.observationsChecked(), report.transfersChecked(),
+                    report.runId(), report.mode(), report.observationsChecked(),
+                    report.transfersChecked(),
                     report.reservesChecked() ? "verified against the chain" : "NOT checked");
             return;
         }
 
-        log.error("Reconciliation {} found {} discrepancies",
-                report.runId(), report.discrepancies().size());
+        log.error("Reconciliation {} ({}) found {} discrepancies",
+                report.runId(), report.mode(), report.discrepancies().size());
         for (Discrepancy discrepancy : report.discrepancies()) {
             log.error("  {} {}: {}",
                     discrepancy.kind(), discrepancy.subject(), discrepancy.detail());

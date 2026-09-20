@@ -25,6 +25,10 @@ ledger:
     # discrepancy is found in the same shift it was created.
     interval: ${LEDGER_RECONCILIATION_INTERVAL:PT15M}
     initial-delay: ${LEDGER_RECONCILIATION_INITIAL_DELAY:PT1M}
+    # How stale the last full pass may get before the next run re-derives the book
+    # instead of reconciling its window. Every incremental verdict in between rests on
+    # totals a previous run wrote down, and this is how often anything checks them.
+    deep-interval: ${LEDGER_RECONCILIATION_DEEP_INTERVAL:PT24H}
 
 management:
   endpoints:

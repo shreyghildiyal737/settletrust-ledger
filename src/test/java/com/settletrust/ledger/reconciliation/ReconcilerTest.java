@@ -25,9 +25,21 @@ import org.jooq.impl.DefaultExecuteListenerProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Timestamp;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.Timestamp;
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.util.List;
@@ -35,6 +47,10 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static com.settletrust.ledger.jooq.Tables.ENTRY;
+import static com.settletrust.ledger.jooq.Tables.RECONCILIATION_CHECKPOINT;
+import static com.settletrust.ledger.jooq.Tables.RECONCILIATION_RUN;
+import static com.settletrust.ledger.jooq.Tables.RECONCILIATION_CHECKPOINT;
+import static com.settletrust.ledger.jooq.Tables.RECONCILIATION_RUN;
 import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
 import static com.settletrust.ledger.jooq.Tables.TRANSFER;
 import static org.junit.jupiter.api.Assertions.assertAll;
@@ -365,7 +381,11 @@ class ReconcilerTest {
                             () -> "unexpected: " + underTheRace.discrepancies()),
                     () -> assertEquals(1, underTheRace.observationsChecked(),
                             "the run answered for the book as it stood when it started"),
-                    () -> assertEquals(2, reconciler.run().orElseThrow().observationsChecked(),
+                    // Deep, because the question is about the book rather than about the
+                    // window. An ordinary run here would follow on from the one above and
+                    // count only the deposit that raced it, which is right and answers
+                    // something else.
+                    () -> assertEquals(2, reconciler.runFully().orElseThrow().observationsChecked(),
                             "and the deposit that raced it really had committed"));
         }
     }
@@ -492,6 +512,287 @@ class ReconcilerTest {
         }
     }
 
+    /**
+     * The half of reconciliation that decides what not to look at.
+     *
+     * <p>A windowed reconciler is easy to write and easy to get quietly wrong, because
+     * every mistake it makes is an omission, and an omission produces a clean report.
+     * These tests all have the same shape: make something wrong, then make sure the run
+     * that was entitled to skip it does not.
+     */
+    @Nested
+    @DisplayName("reconciling from a watermark")
+    class FromAWatermark {
+
+        @Test
+        @DisplayName("the first run is deep, and the next one continues where it stopped")
+        void theWindowsTileTheHistory() {
+            ReconciliationReport first = reconciler.run().orElseThrow();
+            ReconciliationReport second = reconciler.run().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(RunMode.FULL, first.mode(),
+                            "there was nothing to carry forward, so there was nothing to skip"),
+                    () -> assertEquals(0L, first.range().from(),
+                            "a deep run starts below any transaction Postgres has issued"),
+                    () -> assertEquals(RunMode.INCREMENTAL, second.mode()),
+                    () -> assertEquals(first.range().to(), second.range().from(),
+                            "the windows meet exactly: no row examined twice, and none skipped"));
+        }
+
+        @Test
+        @DisplayName("a deep run comes round again once the last one has aged out")
+        void theDeepRunComesRoundAgain() {
+            Reconciler impatient =
+                    new Reconciler(dsl, Clock.systemUTC(), runs, null, Duration.ZERO);
+
+            impatient.run().orElseThrow();
+
+            assertEquals(RunMode.FULL, impatient.run().orElseThrow().mode(),
+                    "with no tolerance for a stale full pass, every run re-derives the book");
+        }
+
+        @Test
+        @DisplayName("a book that was already wrong stays wrong in the eyes of an empty window")
+        void damageBelowTheWatermarkIsStillReported() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            UUID transferId = postPairDirectly(house, customer, Money.of(500L, "EURC"));
+            insertEntry(dsl, transferId, customer, Money.of(1L, "EURC"),
+                    LocalDateTime.now(ZoneOffset.UTC));
+
+            ReconciliationReport deep = reconciler.run().orElseThrow();
+            ReconciliationReport windowed = reconciler.run().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(1,
+                            deep.of(DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO).size()),
+                    () -> assertEquals(1, deep.of(DiscrepancyKind.TRANSFER_NOT_BALANCED).size()),
+                    () -> assertEquals(1,
+                            windowed.of(DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO).size(),
+                            "the net is carried forward rather than re-queried, so it is still "
+                                    + "the whole book that does not balance"),
+                    () -> assertEquals(Money.of(1L, "EURC"),
+                            windowed.of(DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO).getFirst()
+                                    .foundAmount().orElseThrow()),
+                    () -> assertEquals(0, windowed.of(DiscrepancyKind.TRANSFER_NOT_BALANCED).size(),
+                            "and the check that names one transfer has no new transfer to name"));
+        }
+
+        @Test
+        @DisplayName("an entry added after a clean run pulls its whole transfer back into view")
+        void aStrayEntryAddedLaterIsCaughtWithItsSiblings() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            UUID transferId = postPairDirectly(house, customer, Money.of(500L, "EURC"));
+
+            assertTrue(reconciler.run().orElseThrow().agreed(), "the book starts sound");
+
+            insertEntry(dsl, transferId, customer, Money.of(1L, "EURC"),
+                    LocalDateTime.now(ZoneOffset.UTC));
+            ReconciliationReport windowed = reconciler.run().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(RunMode.INCREMENTAL, windowed.mode()),
+                    () -> assertEquals(1,
+                            windowed.of(DiscrepancyKind.TRANSFER_NOT_BALANCED).size()),
+                    () -> assertTrue(windowed.of(DiscrepancyKind.TRANSFER_NOT_BALANCED).getFirst()
+                                    .detail().startsWith("3 entries"),
+                            "the window chose the transfer and the whole group was then read, "
+                                    + "or the finding would have said one entry"));
+        }
+
+        @Test
+        @DisplayName("an account driven negative after a clean run is caught by the window")
+        void anAccountOverdrawnLaterIsCaught() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+
+            assertTrue(reconciler.run().orElseThrow().agreed(), "nothing has moved yet");
+
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+            ReconciliationReport windowed = reconciler.run().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(1, windowed.discrepancies().size(),
+                            () -> "exactly one thing is wrong: " + windowed.discrepancies()),
+                    () -> assertEquals(DiscrepancyKind.CUSTOMER_ACCOUNT_OVERDRAWN,
+                            windowed.discrepancies().getFirst().kind()),
+                    () -> assertEquals(customer.value(),
+                            windowed.discrepancies().getFirst().subject()));
+        }
+
+        @Test
+        @DisplayName("a deposit reversed after it was checked is examined again")
+        void aChangedObservationFallsBackIntoTheWindow() {
+            confirmTheDeposit();
+
+            assertTrue(reconciler.run().orElseThrow().agreed(),
+                    "the deposit was credited properly, so the first run has nothing to say");
+
+            // The chain changes its mind and nothing in the ledger undoes it. The row sits
+            // below the watermark and would be skipped for ever, except that changing it
+            // restamps it with the transaction that did.
+            markObservationReversedWithoutReversingIt();
+            ReconciliationReport windowed = reconciler.run().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(RunMode.INCREMENTAL, windowed.mode()),
+                    () -> assertEquals(1,
+                            windowed.of(DiscrepancyKind.REVERSAL_NOT_RECORDED).size(),
+                            () -> "the restamped observation was skipped: "
+                                    + windowed.discrepancies()),
+                    () -> assertEquals(1, windowed.observationsChecked(),
+                            "and it is the one deposit the window contained"));
+        }
+
+        @Test
+        @DisplayName("a carried total the entries do not support is itself a finding")
+        void aCarriedTotalIsCheckedAgainstTheEntries() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            postPairDirectly(house, customer, Money.of(500L, "EURC"));
+
+            ReconciliationReport honest = reconciler.run().orElseThrow();
+
+            // A run that wrote down totals the book cannot justify. Every incremental run
+            // after it would add its own window to these and agree with itself for ever.
+            UUID impostor = UUID.randomUUID();
+            recordRun(impostor, honest.range().to());
+            claim(impostor, "EURC", 999L, 2L);
+            claim(impostor, "USDC", 0L, 3L);
+
+            ReconciliationReport deep = reconciler.runFully().orElseThrow();
+            List<Discrepancy> drift = deep.of(DiscrepancyKind.CHECKPOINT_DRIFT);
+
+            assertAll(
+                    () -> assertEquals(2, drift.size(),
+                            () -> "both claims were false: " + deep.discrepancies()),
+                    () -> assertEquals(List.of("EURC", "USDC"),
+                            drift.stream().map(Discrepancy::subject).toList()),
+                    () -> assertEquals(Money.of(999L, "EURC"),
+                            drift.getFirst().foundAmount().orElseThrow(),
+                            "the carried figure is what was found, not what was expected"),
+                    () -> assertEquals(Money.zero("EURC"),
+                            drift.getFirst().expectedAmount().orElseThrow(),
+                            "the entries are the authority"),
+                    () -> assertTrue(drift.get(1).detail().contains("3 entries"),
+                            () -> "a net can be right while the count behind it is not: "
+                                    + drift.get(1).detail()));
+        }
+
+        @Test
+        @DisplayName("a transaction that commits out of order is not passed over")
+        void aLateCommitIsNotLost() throws Exception {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            UUID transferId = postPairDirectly(house, customer, Money.of(500L, "EURC"));
+
+            UUID strayId = UUID.randomUUID();
+            UUID overtakingId;
+            ReconciliationReport first;
+
+            // The row every watermark built on an id or a timestamp loses. It is written
+            // first and commits last, and a run that has already seen the transaction that
+            // overtook it would mark itself past both. Here the mark is xmin, and this open
+            // transaction is what holds xmin down, so the run stops short of its own
+            // visible rows rather than stepping over an invisible one.
+            try (Connection late = DriverManager.getConnection(
+                    target.url(), target.username(), target.password())) {
+                late.setAutoCommit(false);
+                writeStrayEntry(late, strayId, transferId, customer);
+
+                // Started after the stray entry and committed before it, which is the whole
+                // difficulty: by every measure the row itself chose, this one is newer.
+                overtakingId = postPairDirectly(house, customer, Money.of(200L, "EURC"));
+
+                first = reconciler.run().orElseThrow();
+                late.commit();
+            }
+
+            ReconciliationReport second = reconciler.run().orElseThrow();
+
+            long strayXid = xidOfEntry(strayId);
+            long overtakingXid = xidOfTransfer(overtakingId);
+            long firstStoppedAt = first.range().to();
+
+            assertAll(
+                    () -> assertTrue(strayXid < overtakingXid,
+                            "the test proves nothing unless the later commit really is older"),
+                    () -> assertTrue(firstStoppedAt <= strayXid,
+                            "the run must stop below the transaction still in flight, even "
+                                    + "though it could already see a newer one"),
+                    () -> assertTrue(first.agreed(),
+                            () -> "nothing in that window was wrong: " + first.discrepancies()),
+                    () -> assertEquals(1, first.transfersChecked(),
+                            "the overtaking transfer was visible and still outside the window"),
+                    () -> assertEquals(firstStoppedAt, second.range().from()),
+                    () -> assertTrue(overtakingXid >= firstStoppedAt
+                                    && overtakingXid < second.range().to(),
+                            "and the next window picks up the transfer it deferred"),
+                    () -> assertEquals(1, second.transfersChecked(),
+                            "which is that transfer and no other"),
+                    () -> assertEquals(1,
+                            second.of(DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO).size(),
+                            () -> "the late commit was skipped: " + second.discrepancies()),
+                    () -> assertEquals(Money.of(1L, "EURC"),
+                            second.of(DiscrepancyKind.ENTRIES_DO_NOT_SUM_TO_ZERO).getFirst()
+                                    .foundAmount().orElseThrow()));
+        }
+
+        private long xidOfEntry(UUID entryId) {
+            return dsl.select(ENTRY.XID).from(ENTRY).where(ENTRY.ID.eq(entryId))
+                    .fetchOne(ENTRY.XID);
+        }
+
+        private long xidOfTransfer(UUID transferId) {
+            return dsl.select(TRANSFER.XID).from(TRANSFER).where(TRANSFER.ID.eq(transferId))
+                    .fetchOne(TRANSFER.XID);
+        }
+
+        private void recordRun(UUID runId, long checkedTo) {
+            dsl.insertInto(RECONCILIATION_RUN)
+                    .set(RECONCILIATION_RUN.ID, runId)
+                    // A second later, so this is the predecessor the next run reads.
+                    .set(RECONCILIATION_RUN.RAN_AT,
+                            LocalDateTime.now(ZoneOffset.UTC).plusSeconds(1))
+                    .set(RECONCILIATION_RUN.MODE, RunMode.INCREMENTAL.name())
+                    .set(RECONCILIATION_RUN.CHECKED_FROM, 0L)
+                    .set(RECONCILIATION_RUN.CHECKED_TO, checkedTo)
+                    .set(RECONCILIATION_RUN.OBSERVATIONS_CHECKED, 0)
+                    .set(RECONCILIATION_RUN.TRANSFERS_CHECKED, 0)
+                    .set(RECONCILIATION_RUN.DISCREPANCY_COUNT, 0)
+                    .execute();
+        }
+
+        private void claim(UUID runId, String currency, long netMinor, long entries) {
+            dsl.insertInto(RECONCILIATION_CHECKPOINT)
+                    .set(RECONCILIATION_CHECKPOINT.RUN_ID, runId)
+                    .set(RECONCILIATION_CHECKPOINT.CURRENCY, currency)
+                    .set(RECONCILIATION_CHECKPOINT.NET_MINOR, netMinor)
+                    .set(RECONCILIATION_CHECKPOINT.ENTRIES_COUNTED, entries)
+                    .execute();
+        }
+
+        /** Raw JDBC, because the point is to hold the transaction open across a run. */
+        private void writeStrayEntry(
+                Connection connection, UUID entryId, UUID transferId, AccountId account)
+                throws Exception {
+
+            try (PreparedStatement insert = connection.prepareStatement(
+                    "insert into entry (id, transfer_id, account_id, amount_minor, currency, "
+                            + "recorded_at) values (?, ?, ?, ?, ?, ?)")) {
+                insert.setObject(1, entryId);
+                insert.setObject(2, transferId);
+                insert.setString(3, account.value());
+                insert.setLong(4, 1L);
+                insert.setString(5, "EURC");
+                insert.setTimestamp(6, Timestamp.valueOf(LocalDateTime.now(ZoneOffset.UTC)));
+                insert.executeUpdate();
+            }
+        }
+    }
+
     private void confirmTheDeposit() {
         chain.mineDeposit(txHash, invoiceId, AMOUNT);
         chain.mineEmpty(CONFIRMATIONS);
@@ -557,7 +858,7 @@ class ReconcilerTest {
                 .orElseThrow(() -> new IllegalStateException("no transfer under " + idempotencyKey));
     }
 
-    private void postPairDirectly(AccountId from, AccountId to, Money amount) {
+    private UUID postPairDirectly(AccountId from, AccountId to, Money amount) {
         UUID transferId = UUID.randomUUID();
         LocalDateTime at = LocalDateTime.now(ZoneOffset.UTC);
 
@@ -576,6 +877,8 @@ class ReconcilerTest {
             insertEntry(transaction, transferId, from, amount.negated(), at);
             insertEntry(transaction, transferId, to, amount, at);
         });
+
+        return transferId;
     }
 
     private static void insertEntry(

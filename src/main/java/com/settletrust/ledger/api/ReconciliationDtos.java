@@ -22,11 +22,20 @@ final class ReconciliationDtos {
      * <p>{@code reservesChecked} says whether the chain itself was asked. False means
      * every check compared our own records against each other, which a clean verdict
      * alone would not reveal.
+     *
+     * <p>{@code mode} is what the counts have to be read through. An INCREMENTAL run
+     * counted its window, and a window with no deposits in it is the ordinary state of a
+     * quiet chain rather than the stopped watcher the same zero would mean on a FULL run.
+     * {@code checkedFrom} and {@code checkedTo} say which window, in transaction ids, so
+     * two consecutive reports can be seen to join up.
      */
     record ReportView(
             UUID runId,
             Instant ranAt,
             boolean agreed,
+            String mode,
+            long checkedFrom,
+            long checkedTo,
             int observationsChecked,
             int transfersChecked,
             boolean reservesChecked,
@@ -37,6 +46,9 @@ final class ReconciliationDtos {
                     report.runId(),
                     report.ranAt(),
                     report.agreed(),
+                    report.mode().name(),
+                    report.range().from(),
+                    report.range().to(),
                     report.observationsChecked(),
                     report.transfersChecked(),
                     report.reservesChecked(),
