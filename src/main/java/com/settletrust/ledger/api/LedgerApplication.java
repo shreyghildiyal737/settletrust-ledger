@@ -3,7 +3,12 @@ package com.settletrust.ledger.api;
 import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
+import com.settletrust.ledger.chain.EscrowContractReserves;
 import com.settletrust.ledger.chain.EscrowReserves;
+import com.settletrust.ledger.chain.EscrowWatcher;
+import com.settletrust.ledger.chain.EthereumChainSource;
+import com.settletrust.ledger.chain.JsonRpc;
+import com.settletrust.ledger.chain.PostgresChainObservations;
 import com.settletrust.ledger.invoice.PostgresInvoices;
 import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
 import com.settletrust.ledger.reconciliation.Reconciler;
@@ -13,6 +18,7 @@ import org.jooq.SQLDialect;
 import org.jooq.impl.DSL;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
@@ -76,10 +82,64 @@ public class LedgerApplication {
     }
 
     /**
-     * Takes a chain to ask about reserves if one is configured, and none otherwise. No
-     * {@link EscrowReserves} bean exists yet, because the contract is written and not
-     * deployed; the reconciler records that its reports were produced without one rather
-     * than letting them read as verified.
+     * The node, when one is configured.
+     *
+     * <p>Every chain bean hangs off {@code ledger.chain.rpc-url} being set, and none of
+     * them exists when it is not. That is deliberate rather than defensive: a deployment
+     * with no chain still runs the bank rail, the invoice lifecycle and the reconciler,
+     * and the reconciler reports {@code reservesChecked: false} so nobody reads its clean
+     * verdict as having verified money on chain.
+     *
+     * <p>Closed by Spring on shutdown, which is why the type is returned rather than the
+     * interface: the context closes an {@link AutoCloseable} bean it can see one on.
+     */
+    @Bean
+    @ConditionalOnProperty("ledger.chain.rpc-url")
+    JsonRpc chainRpc(@Value("${ledger.chain.rpc-url}") String rpcUrl) {
+        return new JsonRpc(rpcUrl);
+    }
+
+    @Bean
+    @ConditionalOnProperty("ledger.chain.rpc-url")
+    EthereumChainSource chainSource(
+            JsonRpc rpc,
+            @Value("${ledger.chain.escrow-address}") String escrowAddress,
+            @Value("${ledger.chain.currency}") String currency) {
+        return new EthereumChainSource(rpc, escrowAddress, currency);
+    }
+
+    @Bean
+    @ConditionalOnProperty("ledger.chain.rpc-url")
+    EscrowReserves escrowReserves(
+            JsonRpc rpc,
+            @Value("${ledger.chain.token-address}") String tokenAddress,
+            @Value("${ledger.chain.escrow-address}") String escrowAddress,
+            @Value("${ledger.chain.currency}") String currency) {
+        return new EscrowContractReserves(rpc, tokenAddress, escrowAddress, currency);
+    }
+
+    /**
+     * @param confirmations how deep a deposit must be before its money is credited. The
+     *                      number is the whole risk position of the chain rail: too few
+     *                      and a reorganisation takes back money already paid out, too
+     *                      many and a buyer waits for an invoice that is already funded.
+     */
+    @Bean
+    @ConditionalOnProperty("ledger.chain.rpc-url")
+    EscrowWatcher escrowWatcher(
+            DSLContext dsl,
+            Clock clock,
+            InvoiceSettlement settlement,
+            @Value("${ledger.chain.confirmations:12}") int confirmations) {
+        return new EscrowWatcher(
+                dsl, new PostgresChainObservations(dsl, clock), settlement, confirmations);
+    }
+
+    /**
+     * Takes a chain to ask about reserves if one is configured, and none otherwise. A
+     * deployment without {@code ledger.chain.rpc-url} has no {@link EscrowReserves} bean,
+     * and the reconciler records that its reports were produced without one rather than
+     * letting them read as verified.
      */
     @Bean
     Reconciler reconciler(

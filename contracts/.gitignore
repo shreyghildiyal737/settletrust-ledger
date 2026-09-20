@@ -1,0 +1,6 @@
+# forge install fetches these; the README says which command. Vendoring the whole of
+# OpenZeppelin into this repo would bury the twenty lines that are actually ours.
+lib/
+out/
+cache/
+broadcast/

@@ -184,10 +184,85 @@ Two cases the tests pin down because they are the ones that hurt:
 Currency codes are three to five letters rather than strictly ISO 4217, because this rail
 settles in stablecoins and `USDC` is four.
 
-**Status, honestly:** the watcher and its reversal logic are tested against a fake chain
-that reorganises on demand, which is the one thing a real testnet will not do when asked.
-The contract is written but **not deployed and not yet exercised against a node**. The
-remaining work is a `ChainSource` backed by a real client and a run against a local chain.
+### Talking to a node
+
+The watcher's logic is proved against a fake chain that reorganises on demand, because
+that is the one thing a real testnet will not do when asked. What a fake cannot prove is
+that the node is being asked the right questions, because a fake answers in whatever shape
+the code that wrote it expected. `EthereumChainSource` and `EscrowContractReserves` are
+the real client, and they are tested against a real node running a real deployment of the
+contract.
+
+**There is no chain library in this service, on purpose.** The watcher reads; it never
+signs, never sends a transaction and never holds a key. That reduces the entire chain
+dependency to four JSON-RPC calls, `eth_blockNumber`, `eth_getBlockByNumber`,
+`eth_getLogs` and `eth_call`, over a wire format that has not moved in years. A client
+library would add a large dependency and a code generator to the deployment image in
+exchange for four requests, and would hide the part worth reading: exactly what is asked
+of the node and exactly how the answer is decoded. A component that can only read also
+cannot be made to move money by a bug, and the settler key lives where releases are
+authorised rather than where the chain is followed.
+
+Three decisions the decoding forces, none of them obvious:
+
+**The invoice id travels as its own UTF-8 bytes, right-padded**, not as a hash of itself.
+Hashing looks like the safer choice for trade finance, where who trades with whom is
+commercially sensitive, and it buys nothing here: the same event indexes the buyer and
+seller addresses, which *is* the relationship, while the id is an opaque token naming no
+party. Hashing it would hide a meaningless string, leave the meaningful pair in plain
+sight, and cost a mapping that has to be kept for ever before any deposit could be
+attributed. Keeping counterparties private is a real problem and a different one, answered
+by not reusing addresses. The cost is a hard 32-byte limit, and an id that does not fit is
+refused rather than truncated: two invoices agreeing in their first 32 bytes would
+otherwise share an escrow.
+
+**The currency code is configured, never read from the token.** An ERC-20 reports its own
+symbol and anyone can deploy a contract calling itself USDC. Taking the code from the
+token would let whoever deployed it choose which book the money lands in and which
+balances it is then netted against.
+
+**A minor unit is the token's own smallest unit**, so nothing is scaled and nothing is
+rounded. The chain counts in 256 bits and `amount_minor` is a `bigint`, so the boundary
+refuses an amount that will not fit rather than truncating it. In practice that fires when
+the contract is pointed at a token with eighteen decimals, which is a misconfiguration
+worth stopping on.
+
+The reserve check asks the **token** for `balanceOf(escrow)`, not the escrow for its own
+total. A `totalHeld()` getter on `InvoiceEscrow` would have been easier to call and
+worthless to trust: it would be the escrow's own bookkeeping, which is the kind of thing
+this check exists to verify. The token's ledger is the one that decides whether the money
+can actually be paid out.
+
+### Running the contract
+
+The contract is compiled and deployed by hand rather than by `mvn test`, so no unit test
+depends on a Solidity toolchain. Everything runs in Docker; nothing is installed on the
+machine:
+
+```bash
+docker run -d --name settletrust-anvil -p 8545:8545 \
+  ghcr.io/foundry-rs/foundry:latest "anvil --host 0.0.0.0"
+
+cd contracts
+git clone --depth 1 --branch v5.1.0 \
+  https://github.com/OpenZeppelin/openzeppelin-contracts lib/openzeppelin-contracts
+docker run --rm -v "$PWD:/work" -w /work ghcr.io/foundry-rs/foundry:latest "forge build"
+```
+
+`contracts/lib` and `contracts/out` are ignored: vendoring the whole of OpenZeppelin would
+bury the twenty lines that are actually ours.
+
+With `LEDGER_TEST_ETH_RPC` set the chain tests deploy a fresh token and escrow per test
+and drive them; without it they skip, because a missing toolchain says nothing about the
+ledger. Transactions are sent against anvil's own unlocked accounts, which is why no
+signing code exists anywhere in this repository, including the tests.
+
+**Status, honestly:** the contract compiles, deploys and runs, and the rail has been
+driven end to end against a real node: deposited on chain, credited by the watcher, and
+the resulting books checked by the reconciler against the token contract's own balance.
+It has **never been deployed to a public network**, and it has not been audited. The
+confirmation depth that would be right for one is a configuration question nobody has
+answered with real numbers.
 
 ## Reconciliation
 
@@ -241,9 +316,9 @@ compared against. A deposit confirmed mid-run therefore shows up on chain and no
 ledger, which inflates the surplus and can never manufacture a shortfall. The timing
 artefact lands on the finding that tolerates one.
 
-**And the report says whether it asked.** No `EscrowReserves` bean exists yet, because
-the contract is written and not deployed, so every report this service currently produces
-carries `reservesChecked: false`. Without that flag a report from a deployment with no
+**And the report says whether it asked.** The `EscrowReserves` bean exists only when
+`ledger.chain.rpc-url` is configured, so a deployment without a node produces reports
+carrying `reservesChecked: false`. Without that flag a report from a deployment with no
 node would be indistinguishable from one that had verified the money was really there,
 and the second is what an operator would assume.
 
@@ -530,6 +605,17 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A deposit reversed after it was checked is examined again | same |
 | A carried total the entries do not support is itself a finding | same |
 | A transaction that commits out of order is not passed over | same |
+| A deposit is read back from a real node as the chain reported it | `EthereumChainSourceTest` |
+| The block hash on a deposit is the hash of the block it landed in | same |
+| The right log is picked out of a transaction that emitted several | same |
+| Only deposits into this escrow are ours | same |
+| The reserve check reads the token's balance, not the escrow's own opinion | same |
+| Money sent straight to the contract counts, and is what a surplus is made of | same |
+| An invoice id too long for the contract is refused rather than truncated | same |
+| Money paid on chain funds a real invoice, once it is deep enough | `OnChainRailTest` |
+| A second pass over the same chain credits nothing twice | same |
+| The reconciler verifies the books against the real token contract | same |
+| A contract short of what the ledger credited is caught against a real node | same |
 | A status is final exactly when it has nowhere left to go | `InvoiceLifecycleSpec` |
 | Every status is reachable from a draft, so none is stranded | same |
 | Each illegal move carries the reason it deserves, across nine cases | same |
@@ -557,15 +643,16 @@ mvn test
 **Shipped:** the domain core, the Postgres storage layer, Flyway migrations, jOOQ
 generated from those migrations, the HTTP API, the invoice lifecycle, escrow funding and
 settlement, the on-chain deposit rail with its reorg handling, reconciliation from a
-watermark with its periodic full sweep, the schedule and lease, and the tests above. The escrow contract is written but not yet deployed or run
-against a node, so the reserve check has a port and a fake and no live implementation:
-every report this service produces today says `reservesChecked: false`, and means it.
+watermark with its periodic full sweep, the schedule and lease, the Ethereum client and
+the escrow contract it reads, and the tests above. The contract has been compiled,
+deployed and driven end to end against a local node; it has never been on a public
+network and has not been audited.
 
 **Next, in order:**
 
-1. A `ChainSource` and an `EscrowReserves` backed by a real Ethereum client, with the
-   contract deployed to a local chain. One piece of work now, since the reserve check is
-   the thing that most needs a real node and the port it needs is already there.
+1. Forge tests for `InvoiceEscrow` itself. It is exercised end to end now, which proves
+   the happy path and nothing about a release by somebody who is not the settler, a
+   double refund, or a token that takes a fee.
 2. A findings feed an operator can subscribe to. Runs and findings are stored and
    readable one at a time; what is missing is "what is open right now", which an
    incremental run cannot answer on its own because a fault it reported once and nobody

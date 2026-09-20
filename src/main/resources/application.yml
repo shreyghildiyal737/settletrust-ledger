@@ -17,6 +17,30 @@ spring:
     locations: classpath:db/migration
 
 ledger:
+  # The on-chain rail, off unless a node is configured. Nothing here has a default: the
+  # beans hang off rpc-url being set at all, so an empty default would switch the rail on
+  # and then fail at startup for want of an address.
+  #
+  #   LEDGER_CHAIN_RPC_URL         an Ethereum JSON-RPC endpoint
+  #   LEDGER_CHAIN_ESCROW_ADDRESS  the deployed InvoiceEscrow
+  #   LEDGER_CHAIN_TOKEN_ADDRESS   the ERC-20 it settles in
+  #   LEDGER_CHAIN_CURRENCY        the ledger's code for that token, e.g. USDC. Configured
+  #                                rather than read from the token, because a token reports
+  #                                its own symbol and anyone can deploy one calling itself
+  #                                USDC.
+  # They are deliberately absent from this file rather than given an empty default. A
+  # placeholder default registers the property as present-but-null, which is enough for
+  # the condition to fire and the beans to be built with nothing in them. Left out
+  # entirely, the property does not exist until the environment variable does, and Spring
+  # maps LEDGER_CHAIN_RPC_URL onto ledger.chain.rpc-url on its own.
+  chain:
+    # How deep a deposit must be before its money is credited. Twelve is the usual
+    # mainnet answer; a chain with finality wants a different number and a local one
+    # wants a smaller.
+    confirmations: ${LEDGER_CHAIN_CONFIRMATIONS:12}
+    # How often the chain is read. Shorter than a block time buys nothing.
+    poll-interval: ${LEDGER_CHAIN_POLL_INTERVAL:PT15S}
+
   reconciliation:
     # Off only for tests that share a database with other tests, where a background run
     # would reconcile somebody else's half-built fixtures.

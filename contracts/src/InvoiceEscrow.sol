@@ -101,7 +101,7 @@ contract InvoiceEscrow is ReentrancyGuard {
      *      when delivery has been confirmed; this contract only enforces that the decision
      *      cannot be acted on twice.
      */
-    function release(bytes32 invoiceId) external onlySettler nonReentrant {
+    function release(bytes32 invoiceId) external nonReentrant onlySettler {
         Escrow storage escrow = escrows[invoiceId];
         uint256 amount = escrow.amount;
         if (amount == 0) revert NothingHeld();
@@ -118,7 +118,7 @@ contract InvoiceEscrow is ReentrancyGuard {
     }
 
     /// @notice Returns the held amount to the buyer, for a dispute or a cancelled invoice.
-    function refund(bytes32 invoiceId) external onlySettler nonReentrant {
+    function refund(bytes32 invoiceId) external nonReentrant onlySettler {
         Escrow storage escrow = escrows[invoiceId];
         uint256 amount = escrow.amount;
         if (amount == 0) revert NothingHeld();
