@@ -28,6 +28,7 @@ import java.util.TreeSet;
 import java.util.UUID;
 
 import static com.settletrust.ledger.jooq.Tables.ACCOUNT;
+import static com.settletrust.ledger.jooq.Tables.CHAIN_CURSOR;
 import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
 import static com.settletrust.ledger.jooq.Tables.ENTRY;
 import static com.settletrust.ledger.jooq.Tables.TRANSFER;
@@ -221,7 +222,8 @@ public class Reconciler {
 
             // Last, and outside the snapshot of necessity, because the chain has no
             // snapshot to join. See reservesAgainstTheChain for why the order matters.
-            found.addAll(reservesAgainstTheChain(snapshot));
+            Optional<Long> readTo = watcherHasReadTo(snapshot);
+            found.addAll(reservesAgainstTheChain(snapshot, readTo));
 
             ReconciliationReport report = new ReconciliationReport(
                     UUID.randomUUID(),
@@ -229,7 +231,7 @@ public class Reconciler {
                     range,
                     deposits.checked(),
                     transfersIn(snapshot, range),
-                    reserves != null,
+                    reserves != null && readTo.isPresent(),
                     found);
 
             // Written inside the same transaction, so the report and the totals the next
@@ -720,20 +722,42 @@ public class Reconciler {
      * address or an event the watcher never saw. The second is a real failure that
      * nothing else here can detect.
      *
-     * <p><b>Why the reads are ordered as they are.</b> The database snapshot is taken
-     * first and the chain asked last, so the chain answer is never older than the ledger
-     * it is compared against. A deposit confirmed while the run is in flight therefore
-     * shows up in the chain balance and not in the ledger, which inflates the surplus and
-     * can never manufacture a shortfall. The timing artefact lands on the finding that
-     * tolerates one, and the alarming finding stays true whenever it fires.
+     * <p><b>Both sides are read at the same height, and ordering the reads was not
+     * enough.</b> This used to ask the chain for its current head, on the reasoning that
+     * asking last meant the chain answer was never older than the ledger, so a timing
+     * artefact would inflate the surplus and never manufacture a shortfall.
+     *
+     * <p>A soak disproved it in four minutes. The ledger's records describe the chain only
+     * as far as the watcher has read, so a deposit that has landed but not been polled is
+     * in the balance and in no record at all, not even a pending one. Nothing explains it,
+     * and the run reports an unaccounted surplus that is nothing but the poll interval.
+     * That is the same fault as scanning logs to a moving {@code latest}: two sides of a
+     * comparison answering for different heights.
+     *
+     * <p>So the balance is asked for at {@code chain_cursor.last_block_read}, which is
+     * exactly the height the observations describe. A deposit the watcher has not reached
+     * is then in neither side and cannot be a finding. The snapshot is still taken before
+     * the chain is asked, which now matters only for the ledger's own totals.
+     *
+     * <p><b>No cursor means no check, not a check against block zero.</b> A watcher that
+     * has never polled has read nothing, and asking the chain what the contract held at
+     * block zero asks about a height at which the contract did not exist: the node answers
+     * empty and the run dies on it. The honest answer is the one the report already has a
+     * field for, so the check is skipped and {@code reservesChecked} is false. That also
+     * costs the shortfall alarm nothing it had, because a watcher that has read nothing has
+     * credited nothing for a shortfall to be against.
      *
      * <p><b>Not windowed.</b> The contract reports what it holds now, in total; there is
      * no such thing as asking it for the window. The ledger side is left whole to match.
      */
-    private List<Discrepancy> reservesAgainstTheChain(DSLContext snapshot) {
-        if (reserves == null) {
+    private List<Discrepancy> reservesAgainstTheChain(
+            DSLContext snapshot, Optional<Long> readTo) {
+
+        if (reserves == null || readTo.isEmpty()) {
             return List.of();
         }
+        long asOfBlock = readTo.get();
+
 
         Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
         Map<String, Long> credited = new HashMap<>();
@@ -759,7 +783,7 @@ public class Reconciler {
                         row.get(CHAIN_OBSERVATION.CURRENCY), row.get(waiting).longValueExact()));
 
         Map<String, Long> held = new HashMap<>();
-        for (Money onChain : reserves.heldOnChain()) {
+        for (Money onChain : reserves.heldOnChain(asOfBlock)) {
             held.merge(onChain.currency(), onChain.minorUnits(), Long::sum);
         }
 
@@ -794,6 +818,18 @@ public class Reconciler {
             }
         }
         return found;
+    }
+
+    /**
+     * How far the watcher has read, or empty if it has never run.
+     *
+     * <p>Every observation the checks above compare against describes the chain up to this
+     * height, so it is the height the chain must be asked about too.
+     */
+    private static Optional<Long> watcherHasReadTo(DSLContext snapshot) {
+        return snapshot.select(CHAIN_CURSOR.LAST_BLOCK_READ)
+                .from(CHAIN_CURSOR)
+                .fetchOptional(CHAIN_CURSOR.LAST_BLOCK_READ);
     }
 
     /** How many transfers fell in this run's window, which on a deep run is all of them. */

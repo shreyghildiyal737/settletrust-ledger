@@ -428,6 +428,42 @@ class ReconcilerTest {
     }
 
     @Test
+    @DisplayName("a deposit the watcher has not read yet is not a surplus")
+    void aDepositAboveTheWatchersCursorIsNotASurplus() {
+        // Mined, and the watcher has not polled. The money is in the contract and there is
+        // no observation at all, not even a pending one, so nothing on our side explains
+        // it. Reading the balance at the head reports the poll interval as an unaccounted
+        // surplus; reading it at the height the watcher has actually reached leaves the
+        // deposit out of both sides.
+        //
+        // Found by soaking the running service rather than by reasoning: the reserve check
+        // asked the chain for its head while every record it compared against described
+        // the cursor, and the two horizons differed by exactly one poll.
+        chain.mineDeposit(txHash, invoiceId, AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+
+        ReconciliationReport beforeAnyPoll = reconcilerAskingTheChain.run().orElseThrow();
+
+        // Once the watcher has read that far, the same deposit reconciles as it always did,
+        // and only now may the report claim the reserves were checked at all.
+        watcher.poll(chain);
+        ReconciliationReport afterThePoll = reconcilerAskingTheChain.runFully().orElseThrow();
+
+        assertAll(
+                () -> assertTrue(beforeAnyPoll.agreed(),
+                        () -> "the poll interval was reported as a discrepancy: "
+                                + beforeAnyPoll.discrepancies()),
+                () -> assertFalse(beforeAnyPoll.reservesChecked(),
+                        "a watcher that has read nothing gives the chain no height to be "
+                                + "asked about, and an unchecked run must say so"),
+                () -> assertTrue(afterThePoll.agreed(),
+                        () -> "unexpected after the watcher caught up: "
+                                + afterThePoll.discrepancies()),
+                () -> assertTrue(afterThePoll.reservesChecked(),
+                        "and now it really did ask the chain"));
+    }
+
+    @Test
     @DisplayName("a deposit still waiting for its confirmations explains a surplus")
     void moneyWaitingToBeCreditedIsNotASurplus() {
         confirmTheDeposit();

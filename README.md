@@ -830,11 +830,64 @@ An alert pointed at the latest report would have missed the unbalanced transfer 
 previous section fires on it. No unexpected warning or error appeared in the log across
 the whole run.
 
-**Next:** those rules have now fired against faults put there on purpose, which says the
-wiring is right and says nothing about the thresholds. What would settle those is a soak:
-this service against a chain and a database for a week, finding out how often a quiet
-system trips them on its own. That is a question about behaviour over time rather than
-about correctness, and it is the one this repository cannot answer by reading.
+### Soaked, and what fell out of it
+
+Then the same service was left running against a churning book: reconciliation every ten
+seconds instead of every fifteen minutes and a deep run every ninety, so a fault needing
+many cycles got them in an hour rather than a fortnight. Transfers and chain deposits ran
+continuously. Nothing was broken on purpose this time, which is the point: with a sound
+book, **any finding at all is a false positive**.
+
+The first pass was mostly reassuring. Thirty-six runs, five of them deep, heap sawtoothing
+between 33 and 46 MB on a 256 MB ceiling with no trend, the pool steady at sixteen idle
+and none active, and a run costing 74 to 123 ms while the book grew fourfold, which is the
+watermark doing what it is for: the cost follows the window, not the ledger. No
+`CHECKPOINT_DRIFT` across five deep runs, so the fold and the entries agreed every time
+they were compared.
+
+It also found three things, and the third is the one worth the exercise.
+
+**A poll interval looked like a surplus.** `RESERVES_UNACCOUNTED` fired on a sound book,
+one second before the watcher's next pass. The reserve check asked the chain for its
+current head while every record it compared against described the watcher's cursor, and a
+deposit that has landed but not been polled is in the balance and in no record at all, not
+even a pending one. Nothing explained it. It is the same fault as scanning logs to a
+moving `latest`: two sides of a comparison answering for different heights. The balance is
+now asked for at `chain_cursor.last_block_read`, so a deposit the watcher has not reached
+is in neither side.
+
+That costs something and the cost is written down: a payout the ledger has not noticed is
+now caught one poll after it happens rather than immediately. Against a spurious surplus
+every time a deposit lands between polls, that is the right way round, because the alarm
+that fires for nothing is the one that stops being read.
+
+**A stranger could stop the rail.** Fixing the above and restarting revealed a worse one.
+The contract takes any `bytes32` from anyone, so a deposit can name an invoice this
+platform never issued, and the observation's foreign key refused it. The exception came
+out of the poll, so the pass died, and it died on the same row on every pass afterwards:
+one deposit of any size, by anyone, and no further deposit for anybody was ever credited
+again. It is now an outcome rather than an exception, counted as `unattributed` and left
+uncredited, and the money stays visible because the reserve check reports a balance our
+records cannot explain, which is exactly what it is.
+
+**And the honest answer was to not answer.** Pinning the balance to the cursor meant a
+watcher that had never polled had no height to offer, so the check asked about block zero,
+where the contract did not exist, and the node's empty answer killed the run. The report
+already has the field for this: the check is skipped and `reservesChecked` is false.
+
+Worth saying plainly: the second and third of those were introduced by the fix to the
+first, and what caught them was `settletrust_reconciliation_runs_total{outcome="failed"}`
+climbing while the log showed no findings. The counter added a few hours earlier is what
+made a silently broken reconciler visible, which is the argument for it better than the
+one in the previous section.
+
+With all three fixed, the same setup ran again and stayed quiet: every pass clean, no
+exception, no failed run, and the gauges reading real numbers instead of the NaN that had
+been the tell. That confirming run was shorter than the one that found the bugs, so it is
+evidence the fixes hold and not evidence that nothing else is there.
+
+**Next:** a soak measured in days rather than minutes. Everything above came out of an
+hour, which says the thresholds are the part nobody has tested.
 
 Two things are worth saying plainly rather than leaving to be discovered. The Kubernetes
 manifests are verified with `kubeconform` and the probe split was tested against a

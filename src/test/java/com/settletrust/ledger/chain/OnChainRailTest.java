@@ -170,12 +170,12 @@ class OnChainRailTest {
                 () -> assertTrue(report.reservesChecked(),
                         "and the run is entitled to say the money was verified on chain"),
                 () -> assertEquals(1, report.observationsChecked()),
-                () -> assertEquals(List.of(AMOUNT), reserves.heldOnChain(),
+                () -> assertEquals(List.of(AMOUNT), reserves.heldOnChain(chain.headBlockNumber()),
                         "which is the amount the contract is actually holding"));
     }
 
     @Test
-    @DisplayName("a contract short of what the ledger credited is caught against a real node")
+    @DisplayName("a payout the ledger has not noticed is caught, one poll after it happens")
     void aRealShortfallIsCaught() {
         fundOnChain();
         chain.mineEmpty(CONFIRMATIONS);
@@ -186,10 +186,22 @@ class OnChainRailTest {
         // here, and no check that compares our records against each other can see it.
         chain.release(escrow, invoiceId);
 
-        ReconciliationReport report =
+        // Not yet, and deliberately. The release is in a block above the watcher's cursor,
+        // and the reserve check answers for the height the watcher has read. Reporting it
+        // now would mean comparing a balance against records that do not describe the same
+        // chain, which is the fault that made a poll interval look like a surplus.
+        ReconciliationReport beforeTheWatcherCatchesUp =
                 new Reconciler(dsl, Clock.systemUTC(), runs, reserves).run().orElseThrow();
 
+        // One poll later the cursor is past the release, and both sides describe it.
+        watcher.poll(deposits);
+        ReconciliationReport report =
+                new Reconciler(dsl, Clock.systemUTC(), runs, reserves).runFully().orElseThrow();
+
         assertAll(
+                () -> assertTrue(beforeTheWatcherCatchesUp.agreed(),
+                        () -> "a payout the watcher has not read is not yet a finding: "
+                                + beforeTheWatcherCatchesUp.discrepancies()),
                 () -> assertEquals(1, report.discrepancies().size(),
                         () -> "expected exactly the shortfall: " + report.discrepancies()),
                 () -> assertEquals("RESERVES_SHORT",

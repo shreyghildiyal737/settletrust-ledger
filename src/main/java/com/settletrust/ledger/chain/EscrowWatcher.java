@@ -59,7 +59,9 @@ public class EscrowWatcher {
             int confirmed,
             int deferred,
             int abandoned,
-            int reversed) {
+            int reversed,
+            /** Deposits naming an invoice this platform never issued. */
+            int unattributed) {
     }
 
     /**
@@ -79,11 +81,26 @@ public class EscrowWatcher {
 
         int recorded = 0;
         int reanchored = 0;
+        int unattributed = 0;
         for (ChainDeposit deposit : chain.depositsFrom(from)) {
-            if (observations.recordIfNew(deposit)) {
-                recorded++;
-            } else if (observations.reanchor(deposit)) {
-                reanchored++;
+            switch (observations.recordIfNew(deposit)) {
+                case RECORDED -> recorded++;
+                case UNKNOWN_INVOICE -> {
+                    // Somebody paid for an invoice this platform never issued. The contract
+                    // accepts any id from anyone, so this is not a fault and must not stop
+                    // the pass: the money stays where it is, uncredited, and the reserve
+                    // check reports a balance our records cannot explain, which is what it
+                    // is for.
+                    unattributed++;
+                    log.warn("Deposit {}:{} names invoice {}, which does not exist here; "
+                                    + "leaving the money uncredited",
+                            deposit.txHash(), deposit.logIndex(), deposit.invoiceId());
+                }
+                case ALREADY_SEEN -> {
+                    if (observations.reanchor(deposit)) {
+                        reanchored++;
+                    }
+                }
             }
         }
         observations.rememberBlockRead(head);
@@ -98,7 +115,8 @@ public class EscrowWatcher {
                 promotions.confirmed(),
                 promotions.deferred(),
                 promotions.abandoned(),
-                reversed);
+                reversed,
+                unattributed);
     }
 
     private int reverseWhatTheChainTookBack(ChainSource chain) {

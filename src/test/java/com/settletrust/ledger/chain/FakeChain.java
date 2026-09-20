@@ -63,14 +63,19 @@ public final class FakeChain implements ChainSource, EscrowReserves {
     }
 
     /**
-     * The sum of every deposit still on the canonical chain. Blocks dropped by a
-     * reorganisation take their deposits with them, which is what the real contract
-     * balance would do too.
+     * The sum of every deposit on the canonical chain at or below {@code asOfBlock}.
+     * Blocks dropped by a reorganisation take their deposits with them, which is what the
+     * real contract balance would do too.
+     *
+     * <p>Honouring the block rather than ignoring it is the point: a fake that answered
+     * for the head whatever it was asked could not reproduce the surplus a real node
+     * reports for a deposit the watcher has not read yet.
      */
     @Override
-    public List<Money> heldOnChain() {
+    public List<Money> heldOnChain(long asOfBlock) {
         Map<String, Long> totals = new HashMap<>(offChainBook);
-        for (Block block : blocks) {
+        for (int number = 0; number < blocks.size() && number <= asOfBlock; number++) {
+            Block block = blocks.get(number);
             for (ChainDeposit deposit : block.deposits()) {
                 totals.merge(
                         deposit.amount().currency(), deposit.amount().minorUnits(), Long::sum);

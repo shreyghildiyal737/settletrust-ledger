@@ -89,6 +89,32 @@ class EscrowWatcherTest {
     }
 
     @Test
+    @DisplayName("a deposit for an invoice we never issued does not stop the rail")
+    void anUnknownInvoiceDoesNotWedgeTheWatcher() {
+        // The contract takes any bytes32 from anyone, so a stranger can pay for an invoice
+        // this platform never issued whenever they like. Before this was handled, the
+        // insert failed its foreign key on every pass for ever and nobody else's deposits
+        // were credited again: one deposit of any size stopped the rail for everyone.
+        chain.mineDeposit(txHash + "-stranger", "inv-never-issued", AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+
+        EscrowWatcher.PollResult unknown = watcher.poll(chain);
+
+        // And the pass after it still works, which is the part that was broken: the
+        // invoice this test was given is real, and its deposit must still be credited.
+        chain.mineDeposit(txHash, invoiceId, AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+        EscrowWatcher.PollResult afterwards = watcher.poll(chain);
+
+        assertAll(
+                () -> assertEquals(1, unknown.unattributed(),
+                        "the deposit is counted as unattributable rather than thrown"),
+                () -> assertEquals(0, unknown.recorded()),
+                () -> assertEquals(1, afterwards.confirmed(),
+                        () -> "the rail stopped after an unattributable deposit: " + afterwards));
+    }
+
+    @Test
     @DisplayName("a deposit is not credited until it is buried deep enough")
     void confirmationsAreWaitedFor() {
         chain.mineDeposit(txHash, invoiceId, AMOUNT);

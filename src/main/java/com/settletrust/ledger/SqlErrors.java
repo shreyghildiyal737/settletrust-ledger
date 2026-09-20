@@ -12,6 +12,7 @@ import java.sql.SQLException;
 public final class SqlErrors {
 
     private static final String UNIQUE_VIOLATION = "23505";
+    private static final String FOREIGN_KEY_VIOLATION = "23503";
 
     private SqlErrors() {
     }
@@ -22,8 +23,20 @@ public final class SqlErrors {
      * exception before it reaches us.
      */
     public static boolean isUniqueViolation(Throwable failure) {
+        return hasState(failure, UNIQUE_VIOLATION);
+    }
+
+    /**
+     * True if this failure was a foreign key violation, which is how the database says
+     * the row refers to something that does not exist.
+     */
+    public static boolean isForeignKeyViolation(Throwable failure) {
+        return hasState(failure, FOREIGN_KEY_VIOLATION);
+    }
+
+    private static boolean hasState(Throwable failure, String sqlState) {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SQLException sql && UNIQUE_VIOLATION.equals(sql.getSQLState())) {
+            if (cause instanceof SQLException sql && sqlState.equals(sql.getSQLState())) {
                 return true;
             }
         }

@@ -1,6 +1,7 @@
 package com.settletrust.ledger.chain;
 
 import com.settletrust.ledger.Money;
+import com.settletrust.ledger.SqlErrors;
 import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.Record;
@@ -37,12 +38,46 @@ public class PostgresChainObservations {
     }
 
     /**
-     * Records a deposit as pending if it has not been seen before, and reports whether it
-     * was new. Seeing the same event twice is normal rather than exceptional: a restart,
-     * an overlapping scan range or a reorganisation all replay events.
+     * What happened when a deposit the chain reported was written down.
+     *
+     * <p>Three outcomes rather than two, because a deposit can name an invoice this
+     * platform never issued. The contract takes any {@code bytes32} from anyone, so that
+     * is not an error in the watcher, it is a thing the world does.
      */
-    public boolean recordIfNew(ChainDeposit deposit) {
-        int inserted = dsl.insertInto(CHAIN_OBSERVATION)
+    public enum Recording {
+        RECORDED,
+        ALREADY_SEEN,
+        /** The deposit names an invoice that does not exist here. */
+        UNKNOWN_INVOICE
+    }
+
+    /**
+     * Records a deposit as pending if it has not been seen before, and says what happened.
+     * Seeing the same event twice is normal rather than exceptional: a restart, an
+     * overlapping scan range or a reorganisation all replay events.
+     */
+    public Recording recordIfNew(ChainDeposit deposit) {
+        int inserted;
+        try {
+            inserted = insertPending(deposit);
+        } catch (RuntimeException failure) {
+            // The invoice foreign key. Anyone may call deposit() with any invoice id, so a
+            // deposit for an invoice we never issued is a thing a stranger can do at will,
+            // and it must not be able to stop the rail: before this was caught, one such
+            // deposit failed the insert on every pass for ever, and no later deposit for
+            // anybody was credited again. The money is still in the contract and still
+            // visible, because the reserve check reports a balance nothing on our side
+            // explains, which is exactly what this is.
+            if (SqlErrors.isForeignKeyViolation(failure)) {
+                return Recording.UNKNOWN_INVOICE;
+            }
+            throw failure;
+        }
+        return inserted == 1 ? Recording.RECORDED : Recording.ALREADY_SEEN;
+    }
+
+    private int insertPending(ChainDeposit deposit) {
+        return dsl.insertInto(CHAIN_OBSERVATION)
                 .set(CHAIN_OBSERVATION.TX_HASH, deposit.txHash())
                 .set(CHAIN_OBSERVATION.LOG_INDEX, deposit.logIndex())
                 .set(CHAIN_OBSERVATION.BLOCK_NUMBER, deposit.blockNumber())
@@ -54,7 +89,6 @@ public class PostgresChainObservations {
                 .set(CHAIN_OBSERVATION.FIRST_SEEN, now())
                 .onConflictDoNothing()
                 .execute();
-        return inserted == 1;
     }
 
     /**

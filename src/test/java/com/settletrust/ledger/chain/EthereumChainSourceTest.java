@@ -159,14 +159,14 @@ class EthereumChainSourceTest {
     @Test
     @DisplayName("the reserve check reads the token's balance, not the escrow's own opinion")
     void theReservesAreWhatTheTokenSays() {
-        assertEquals(List.of(Money.zero("USDC")), reserves.heldOnChain(),
+        assertEquals(List.of(Money.zero("USDC")), reserves.heldOnChain(chain.headBlockNumber()),
                 "a contract holding nothing still answers, or a clean run cannot be told "
                         + "from an unanswered one");
 
         fund(anInvoiceId(), AMOUNT);
         fund(anInvoiceId(), AMOUNT);
 
-        assertEquals(List.of(Money.of(2 * AMOUNT, "USDC")), reserves.heldOnChain());
+        assertEquals(List.of(Money.of(2 * AMOUNT, "USDC")), reserves.heldOnChain(chain.headBlockNumber()));
     }
 
     @Test
@@ -178,7 +178,7 @@ class EthereumChainSourceTest {
         chain.mint(token, escrow, 7L);
 
         assertAll(
-                () -> assertEquals(List.of(Money.of(AMOUNT + 7L, "USDC")), reserves.heldOnChain()),
+                () -> assertEquals(List.of(Money.of(AMOUNT + 7L, "USDC")), reserves.heldOnChain(chain.headBlockNumber())),
                 () -> assertEquals(1, deposits.depositsFrom(0).size(),
                         "and the watcher rightly knows nothing about it"));
     }
@@ -229,7 +229,7 @@ class EthereumChainSourceTest {
                 new EscrowContractReserves(chain.rpc(), chain.account(5), escrow, "USDC");
 
         JsonRpc.ChainUnavailable refused =
-                assertThrows(JsonRpc.ChainUnavailable.class, misconfigured::heldOnChain);
+                assertThrows(JsonRpc.ChainUnavailable.class, () -> misconfigured.heldOnChain(chain.headBlockNumber()));
 
         assertTrue(refused.getMessage().contains("token-address"),
                 () -> "the message should point at the setting to fix: "

@@ -61,15 +61,20 @@ public class EscrowContractReserves implements EscrowReserves {
      * token at construction and cannot hold another. A platform settling in two
      * stablecoins runs two escrows and two of these, and the reconciler sums the list.
      *
-     * <p>Read at {@code latest} rather than at a fixed block, which the interface requires
-     * and the reconciler relies on: it takes its database snapshot first and asks the
-     * chain last, so this answer is never older than the ledger it is compared against.
+     * <p>Read at the block the caller names rather than at {@code latest}, so the answer
+     * describes the same height as the records it will be compared against. See
+     * {@link EscrowReserves#heldOnChain(long)} for what asking at {@code latest} cost.
      */
     @Override
-    public List<Money> heldOnChain() {
+    public List<Money> heldOnChain(long asOfBlock) {
+        if (asOfBlock < 0) {
+            throw new IllegalArgumentException("a block number cannot be negative");
+        }
+
         String balance = rpc.call("eth_call", Map.of(
                 "to", tokenAddress,
-                "data", BALANCE_OF + Hex.addressWord(escrowAddress)), "latest").asText();
+                "data", BALANCE_OF + Hex.addressWord(escrowAddress)),
+                Hex.quantity(asOfBlock)).asText();
 
         // An eth_call against an address holding no code returns empty rather than
         // failing, and so does a contract with no balanceOf. Left to fall through it

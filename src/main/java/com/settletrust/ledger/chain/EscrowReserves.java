@@ -22,15 +22,28 @@ import java.util.List;
 public interface EscrowReserves {
 
     /**
-     * The balance the escrow contract holds, one entry per currency, as of the chain's
-     * current head.
+     * The balance the escrow contract holds, one entry per currency, as of a named block.
      *
-     * <p>As of the head rather than a named block, which makes this a moving number. The
-     * reconciler handles that by ordering its reads rather than by pinning a block: it
-     * takes the database snapshot first and asks the chain second, so the chain answer is
-     * never older than the ledger it is being compared against. That makes a reported
-     * shortfall real, and pushes any timing artefact into the surplus, which is the
-     * finding that can afford to be soft.
+     * <p><b>The block is a parameter because the alternative was wrong.</b> This used to
+     * answer for the chain's current head, on the reasoning that asking the chain last
+     * meant its answer was never older than the ledger it was compared against, so any
+     * timing artefact would land on the surplus rather than on the alarm.
+     *
+     * <p>That reasoning had a hole, and a soak found it in four minutes. The ledger's
+     * records describe the chain only as far as the watcher has read. A deposit that has
+     * landed on chain but that the watcher has not polled yet is in the contract's balance
+     * and in no record at all, not even as a pending observation, so nothing explains it
+     * and the run reports an unaccounted surplus that is simply the poll interval. It is
+     * the same mistake as scanning logs to a moving {@code latest}: two sides of a
+     * comparison describing different heights.
+     *
+     * <p>So the caller names the height, and passes the one its own records describe.
+     *
+     * @param asOfBlock the block to read the balance at. Zero is a legitimate answer of
+     *                  "nothing has been read yet" rather than an error: a watcher that
+     *                  has never run has observed nothing, so there is nothing to compare
+     *                  and no finding to make. Whether the watcher is alive is a different
+     *                  question, answered by how old its last pass is.
      */
-    List<Money> heldOnChain();
+    List<Money> heldOnChain(long asOfBlock);
 }
