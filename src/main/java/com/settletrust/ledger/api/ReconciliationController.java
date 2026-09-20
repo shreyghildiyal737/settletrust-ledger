@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import static com.settletrust.ledger.api.ReconciliationDtos.OpenFindingsView;
 import static com.settletrust.ledger.api.ReconciliationDtos.ReportView;
 
 /**
@@ -51,6 +52,24 @@ class ReconciliationController {
         return (deep ? reconciler.runFully() : reconciler.run())
                 .map(report -> ResponseEntity.status(HttpStatus.CREATED).body(ReportView.of(report)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.CONFLICT).build());
+    }
+
+    /**
+     * What is wrong now, rather than what some pass once found.
+     *
+     * <p>The endpoint an alert should point at. A report says what one run saw, and since
+     * runs became incremental that is a statement about a window: a fault found once and
+     * never fixed stops appearing in later reports, so a clean {@code runs/latest} does
+     * not mean a clean book.
+     *
+     * <p>404 when nothing has ever been reconciled, which is deliberately not an empty
+     * list. "No open findings" and "nobody has looked" must not answer alike.
+     */
+    @GetMapping("/findings/open")
+    ResponseEntity<OpenFindingsView> openFindings() {
+        return runs.openFindings()
+                .map(open -> ResponseEntity.ok(OpenFindingsView.of(open)))
+                .orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     @GetMapping("/runs/latest")

@@ -41,9 +41,20 @@ public class EthereumChainSource implements ChainSource {
     static final String DEPOSITED_TOPIC =
             "0xcc40be07b95c3742b1185187814fe5ab97a9599e564db0423cdc3b8c4b9e87d1";
 
+    /**
+     * How many blocks one {@code eth_getLogs} may span.
+     *
+     * <p>Ten thousand because that is the cap the common hosted providers apply, and a
+     * request over a wider range is refused outright rather than answered slowly. A node
+     * of one's own has no such limit and pays nothing for the paging.
+     */
+    private static final long DEFAULT_MAX_BLOCK_SPAN = 10_000;
+
     private final JsonRpc rpc;
     private final String escrowAddress;
     private final String currency;
+    private final long deployedAtBlock;
+    private final long maxBlockSpan;
 
     /**
      * @param escrowAddress the deployed {@code InvoiceEscrow}
@@ -55,11 +66,39 @@ public class EthereumChainSource implements ChainSource {
      *                      which balances it is then netted against.
      */
     public EthereumChainSource(JsonRpc rpc, String escrowAddress, String currency) {
+        this(rpc, escrowAddress, currency, 0L, DEFAULT_MAX_BLOCK_SPAN);
+    }
+
+    /**
+     * @param deployedAtBlock the block the escrow was deployed in. Nothing below it can
+     *                        contain a deposit into a contract that did not exist yet, so
+     *                        this is where a first scan starts. Zero is right for a chain
+     *                        created for the occasion and wrong for every real one: a
+     *                        watcher with an empty cursor would otherwise ask for every
+     *                        log since genesis, which a hosted provider refuses and a node
+     *                        of one's own answers slowly enough to look like a hang.
+     * @param maxBlockSpan    the widest range asked for in one call
+     */
+    public EthereumChainSource(
+            JsonRpc rpc,
+            String escrowAddress,
+            String currency,
+            long deployedAtBlock,
+            long maxBlockSpan) {
+
         this.rpc = Objects.requireNonNull(rpc, "rpc must not be null");
         this.escrowAddress = requireAddress(escrowAddress);
         // Through Money, so the code is validated and uppercased by the one rule that
         // decides what a currency code is anywhere in this service.
         this.currency = Money.zero(currency).currency();
+        if (deployedAtBlock < 0) {
+            throw new IllegalArgumentException("a block number cannot be negative");
+        }
+        if (maxBlockSpan < 1) {
+            throw new IllegalArgumentException("a scan must be allowed at least one block");
+        }
+        this.deployedAtBlock = deployedAtBlock;
+        this.maxBlockSpan = maxBlockSpan;
     }
 
     @Override
@@ -71,34 +110,49 @@ public class EthereumChainSource implements ChainSource {
      * {@inheritDoc}
      *
      * <p>Filtered by address and topic at the node, so a busy chain does not become this
-     * process's problem. The range ends at {@code latest} rather than at a height read
-     * beforehand, which means the head may move while the call is in flight; that is safe
-     * because the watcher decides what is confirmed from a depth it reads separately, and
-     * a deposit that arrives one pass early is simply not deep enough yet.
+     * process's problem, and never below the block the contract was deployed in.
      *
-     * <p>A hosted node will cap either the block span or the number of logs returned. This
-     * asks for one open-ended range because the watcher keeps a cursor and never falls far
-     * behind; against a provider with a cap, the cursor is what a paged version would be
-     * built on.
+     * <p>The head is read once and the scan ends there, rather than asking for
+     * {@code latest} on each page. Paging to a moving target would return a set of logs
+     * that belongs to no single height, and the report of how far the chain was read would
+     * name a block the earlier pages had not covered. A deposit that lands during the scan
+     * is simply picked up next pass, and would not have been deep enough to act on anyway.
+     *
+     * <p>Paged because a hosted provider caps the span of a single {@code eth_getLogs} and
+     * refuses anything wider outright. In the steady state the cursor is a few blocks
+     * behind the head and this is one request; the paging is for the first scan after a
+     * deployment and for catching up after an outage, which are exactly the moments the
+     * unpaged version would fail.
      */
     @Override
     public List<ChainDeposit> depositsFrom(long fromBlock) {
+        long head = headBlockNumber();
+        long from = Math.max(fromBlock, deployedAtBlock);
+
+        List<ChainDeposit> deposits = new ArrayList<>();
+        while (from <= head) {
+            long to = Math.min(head, from + maxBlockSpan - 1);
+            collectDeposits(from, to, deposits);
+            from = to + 1;
+        }
+        return deposits;
+    }
+
+    private void collectDeposits(long fromBlock, long toBlock, List<ChainDeposit> into) {
         JsonNode logs = rpc.call("eth_getLogs", Map.of(
-                "fromBlock", Hex.quantity(Math.max(0, fromBlock)),
-                "toBlock", "latest",
+                "fromBlock", Hex.quantity(fromBlock),
+                "toBlock", Hex.quantity(toBlock),
                 "address", escrowAddress,
                 "topics", List.of(DEPOSITED_TOPIC)));
 
-        List<ChainDeposit> deposits = new ArrayList<>();
         for (JsonNode log : logs) {
             // A log still in the mempool has no position yet. The watcher only acts on
             // confirmations, so an entry with nothing to confirm against is not yet news.
             if (log.path("removed").asBoolean(false) || log.path("blockNumber").isNull()) {
                 continue;
             }
-            deposits.add(toDeposit(log));
+            into.add(toDeposit(log));
         }
-        return deposits;
     }
 
     @Override

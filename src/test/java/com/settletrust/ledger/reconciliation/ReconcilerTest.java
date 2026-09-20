@@ -55,6 +55,7 @@ import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
 import static com.settletrust.ledger.jooq.Tables.TRANSFER;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -790,6 +791,143 @@ class ReconcilerTest {
                 insert.setTimestamp(6, Timestamp.valueOf(LocalDateTime.now(ZoneOffset.UTC)));
                 insert.executeUpdate();
             }
+        }
+    }
+
+    /**
+     * "What is wrong now", which is not a question any single report answers.
+     *
+     * <p>The reason this exists at all is the windowed run: it reports a fault once and
+     * then moves past it, so a fault nobody fixed stops appearing and a clean latest
+     * report stops meaning a clean book. Every test here is about that difference.
+     */
+    @Nested
+    @DisplayName("what is still open")
+    class StillOpen {
+
+        @Test
+        @DisplayName("nothing reconciled yet is not the same answer as nothing wrong")
+        void anUnreconciledBookHasNoAnswer() {
+            assertTrue(runs.openFindings().isEmpty(),
+                    "a service whose reconciler has never run must not report a clean book");
+        }
+
+        @Test
+        @DisplayName("a fault a deep run found is open, and dated from when it found it")
+        void aFaultTheDeepRunFoundIsOpen() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+
+            ReconciliationReport deep = reconciler.run().orElseThrow();
+            OpenFindings open = runs.openFindings().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(1, open.findings().size(),
+                            () -> "expected the overdraw: " + open.findings()),
+                    () -> assertEquals(DiscrepancyKind.CUSTOMER_ACCOUNT_OVERDRAWN,
+                            open.findings().getFirst().kind()),
+                    () -> assertEquals(customer.value(), open.findings().getFirst().subject()),
+                    () -> assertEquals(deep.runId(), open.sinceRun(),
+                            "anchored on the run that looked everywhere"),
+                    () -> assertEquals(deep.runId(), open.findings().getFirst().firstSeenRun()),
+                    () -> assertFalse(open.allClear()));
+        }
+
+        /**
+         * The whole point. A windowed run finds something, the next windowed run has no
+         * reason to look at it again, and the fault is still there.
+         */
+        @Test
+        @DisplayName("a fault a window found stays open after later windows pass it by")
+        void aFaultFoundInAWindowStaysOpen() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+
+            assertTrue(reconciler.run().orElseThrow().agreed(), "the book starts sound");
+
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+            ReconciliationReport found = reconciler.run().orElseThrow();
+            ReconciliationReport quiet = reconciler.run().orElseThrow();
+
+            OpenFindings open = runs.openFindings().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(1, found.discrepancies().size(),
+                            "the window that contained the damage reported it"),
+                    () -> assertTrue(quiet.agreed(),
+                            "and the next window had no reason to look at it again"),
+                    () -> assertEquals(1, open.findings().size(),
+                            () -> "so the report went quiet and the fault did not: "
+                                    + open.findings()),
+                    () -> assertEquals(found.runId(),
+                            open.findings().getFirst().lastSeenRun(),
+                            "last seen by the run that found it, not by the quiet one"));
+        }
+
+        @Test
+        @DisplayName("a fault seen by several runs is one finding, counted")
+        void repeatedSightingsAreOneFinding() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+
+            ReconciliationReport first = reconciler.runFully().orElseThrow();
+            ReconciliationReport second = reconciler.runFully().orElseThrow();
+
+            OpenFindings open = runs.openFindings().orElseThrow();
+
+            assertAll(
+                    () -> assertEquals(1, open.findings().size(),
+                            "one account is overdrawn, however many runs say so"),
+                    () -> assertEquals(1, open.findings().getFirst().timesReported(),
+                            "and the count is of runs since the anchor, which is the "
+                                    + "second one"),
+                    () -> assertEquals(second.runId(), open.sinceRun(),
+                            "the anchor moved to the newer deep run"),
+                    () -> assertNotEquals(first.runId(), open.sinceRun()));
+        }
+
+        @Test
+        @DisplayName("a fault a deep run no longer finds is closed")
+        void aFixedFaultDropsOut() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+
+            reconciler.run().orElseThrow();
+            assertEquals(1, runs.openFindings().orElseThrow().findings().size());
+
+            // Put the money back, the only way this ledger allows: a new pair in the
+            // opposite direction, never an edit to the one that caused it.
+            postPairDirectly(house, customer, Money.of(500L, "EURC"));
+            reconciler.runFully().orElseThrow();
+
+            OpenFindings open = runs.openFindings().orElseThrow();
+
+            assertAll(
+                    () -> assertTrue(open.allClear(),
+                            () -> "a pass that looked everywhere did not find it: "
+                                    + open.findings()),
+                    () -> assertEquals(0, open.findings().size()));
+        }
+
+        @Test
+        @DisplayName("only a deep run closes anything, because only it looked everywhere")
+        void aWindowCannotCloseWhatItDidNotLookAt() {
+            AccountId customer = openAccount("customer-" + run, Account.Kind.CUSTOMER);
+            AccountId house = openAccount("house-" + run, Account.Kind.HOUSE);
+            postPairDirectly(customer, house, Money.of(500L, "EURC"));
+
+            reconciler.run().orElseThrow();
+            postPairDirectly(house, customer, Money.of(500L, "EURC"));
+
+            // Windowed, and the window does contain the repair, so this run is clean.
+            assertTrue(reconciler.run().orElseThrow().agreed());
+
+            assertEquals(1, runs.openFindings().orElseThrow().findings().size(),
+                    "the window agreeing is not evidence of a fix: it saw one account, "
+                            + "and the anchor is still the run that found the fault");
         }
     }
 

@@ -74,6 +74,30 @@ class ReconciliationApiTest {
     }
 
     @Test
+    @DisplayName("the open findings say what they are anchored on")
+    void openFindingsCarryTheirAnchor() throws Exception {
+        // A deep run first, so there is an anchor. Without one the endpoint answers 404,
+        // which is the right answer and not the one under test here.
+        MvcResult deep = mvc.perform(post("/api/v1/reconciliation/runs").param("deep", "true"))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String runId = json.readTree(deep.getResponse().getContentAsString())
+                .get("runId")
+                .asText();
+
+        mvc.perform(get("/api/v1/reconciliation/findings/open"))
+                .andExpect(status().isOk())
+                // The database is shared with tests that leave deliberate wreckage, so
+                // whether anything is open says nothing. That it is anchored on the run
+                // just made, and counts what it lists, is the contract.
+                .andExpect(jsonPath("$.sinceRun", is(runId)))
+                .andExpect(jsonPath("$.sinceRanAt", notNullValue()))
+                .andExpect(jsonPath("$.openCount", greaterThanOrEqualTo(0)))
+                .andExpect(jsonPath("$.findings", notNullValue()));
+    }
+
+    @Test
     @DisplayName("deep=true re-derives the book rather than the window since the last run")
     void aDeepRunCanBeDemanded() throws Exception {
         // One run first, so there is a watermark an ordinary run would have continued from

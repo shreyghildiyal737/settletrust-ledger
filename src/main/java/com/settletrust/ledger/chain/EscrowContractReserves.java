@@ -71,6 +71,17 @@ public class EscrowContractReserves implements EscrowReserves {
                 "to", tokenAddress,
                 "data", BALANCE_OF + Hex.addressWord(escrowAddress)), "latest").asText();
 
+        // An eth_call against an address holding no code returns empty rather than
+        // failing, and so does a contract with no balanceOf. Left to fall through it
+        // becomes a hex parsing error several frames away from the configuration that
+        // caused it, and the reconciler would report the reserves as unreadable rather
+        // than as unconfigured.
+        if (Hex.stripPrefix(balance).isEmpty()) {
+            throw new JsonRpc.ChainUnavailable(
+                    "no ERC-20 answered balanceOf at " + tokenAddress
+                            + "; check ledger.chain.token-address");
+        }
+
         long held = Hex.toMinorUnits(
                 balance, "the " + currency + " balance of escrow " + escrowAddress);
         return List.of(Money.of(held, currency));

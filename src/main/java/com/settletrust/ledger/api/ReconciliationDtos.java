@@ -2,6 +2,8 @@ package com.settletrust.ledger.api;
 
 import com.settletrust.ledger.Money;
 import com.settletrust.ledger.reconciliation.Discrepancy;
+import com.settletrust.ledger.reconciliation.OpenFinding;
+import com.settletrust.ledger.reconciliation.OpenFindings;
 import com.settletrust.ledger.reconciliation.ReconciliationReport;
 
 import java.time.Instant;
@@ -53,6 +55,50 @@ final class ReconciliationDtos {
                     report.transfersChecked(),
                     report.reservesChecked(),
                     report.discrepancies().stream().map(FindingView::of).toList());
+        }
+    }
+
+    /**
+     * What is outstanding, and what that claim rests on.
+     *
+     * <p>{@code sinceRun} and {@code sinceRanAt} are not decoration. Nothing listed here
+     * is open because a run said so recently; everything <i>not</i> listed is absent
+     * because the full run named here did not find it, so the age of that run is the age
+     * of the assurance.
+     */
+    record OpenFindingsView(
+            UUID sinceRun,
+            Instant sinceRanAt,
+            boolean allClear,
+            int openCount,
+            List<OpenFindingView> findings) {
+
+        static OpenFindingsView of(OpenFindings open) {
+            return new OpenFindingsView(
+                    open.sinceRun(),
+                    open.sinceRanAt(),
+                    open.allClear(),
+                    open.findings().size(),
+                    open.findings().stream().map(OpenFindingView::of).toList());
+        }
+    }
+
+    record OpenFindingView(
+            FindingView finding,
+            Instant firstSeen,
+            UUID firstSeenRun,
+            Instant lastSeen,
+            UUID lastSeenRun,
+            int timesReported) {
+
+        static OpenFindingView of(OpenFinding open) {
+            return new OpenFindingView(
+                    FindingView.of(open.latest()),
+                    open.firstSeen(),
+                    open.firstSeenRun(),
+                    open.lastSeen(),
+                    open.lastSeenRun(),
+                    open.timesReported());
         }
     }
 

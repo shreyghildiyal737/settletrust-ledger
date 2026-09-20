@@ -104,8 +104,11 @@ public class LedgerApplication {
     EthereumChainSource chainSource(
             JsonRpc rpc,
             @Value("${ledger.chain.escrow-address}") String escrowAddress,
-            @Value("${ledger.chain.currency}") String currency) {
-        return new EthereumChainSource(rpc, escrowAddress, currency);
+            @Value("${ledger.chain.currency}") String currency,
+            @Value("${ledger.chain.deployed-at-block:0}") long deployedAtBlock,
+            @Value("${ledger.chain.max-block-span:10000}") long maxBlockSpan) {
+        return new EthereumChainSource(
+                rpc, escrowAddress, currency, deployedAtBlock, maxBlockSpan);
     }
 
     @Bean

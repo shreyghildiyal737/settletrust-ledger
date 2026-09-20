@@ -4,12 +4,15 @@ import com.settletrust.ledger.Money;
 import org.jooq.Configuration;
 import org.jooq.DSLContext;
 import org.jooq.Record;
+import org.jooq.Result;
 import org.jooq.impl.DSL;
 
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -147,6 +150,75 @@ public class PostgresReconciliationRuns {
                                 row.get(RECONCILIATION_CHECKPOINT.NET_MINOR),
                                 row.get(RECONCILIATION_CHECKPOINT.ENTRIES_COUNTED))));
         return totals;
+    }
+
+    /**
+     * The discrepancies still outstanding, anchored on the last run that looked
+     * everywhere.
+     *
+     * <p>Empty when nothing has ever been reconciled, which is a different answer from
+     * "nothing is wrong" and is kept different on purpose: a service whose reconciler has
+     * never run must not be able to report a clean book.
+     *
+     * <p>See {@link OpenFindings} for why the anchor is the newest full run and why this
+     * is computed rather than stored.
+     */
+    public Optional<OpenFindings> openFindings() {
+        Record anchor = dsl.select(RECONCILIATION_RUN.ID, RECONCILIATION_RUN.RAN_AT)
+                .from(RECONCILIATION_RUN)
+                .where(RECONCILIATION_RUN.MODE.eq(RunMode.FULL.name()))
+                .orderBy(RECONCILIATION_RUN.RAN_AT.desc(), RECONCILIATION_RUN.ID.desc())
+                .limit(1)
+                .fetchOne();
+
+        if (anchor == null) {
+            return Optional.empty();
+        }
+
+        UUID anchorId = anchor.get(RECONCILIATION_RUN.ID);
+        LocalDateTime anchorAt = anchor.get(RECONCILIATION_RUN.RAN_AT);
+
+        // The anchor run and everything after it. Two runs recorded in the same instant are
+        // separated by the same id tiebreak the rest of this class orders by, so the cut is
+        // exactly the one "the newest full run" names and not a second either side of it.
+        Result<Record> reports = dsl.select()
+                .from(RECONCILIATION_FINDING)
+                .join(RECONCILIATION_RUN)
+                .on(RECONCILIATION_RUN.ID.eq(RECONCILIATION_FINDING.RUN_ID))
+                .where(RECONCILIATION_RUN.RAN_AT.gt(anchorAt)
+                        .or(RECONCILIATION_RUN.RAN_AT.eq(anchorAt)
+                                .and(RECONCILIATION_RUN.ID.ge(anchorId))))
+                .orderBy(RECONCILIATION_RUN.RAN_AT.asc(), RECONCILIATION_RUN.ID.asc())
+                .fetch();
+
+        // Keyed on kind and subject: the same fault found by six runs is one thing wrong.
+        Map<String, OpenFinding> open = new LinkedHashMap<>();
+        for (Record row : reports) {
+            Discrepancy discrepancy = toDiscrepancy(row);
+            UUID runId = row.get(RECONCILIATION_RUN.ID);
+            Instant ranAt = row.get(RECONCILIATION_RUN.RAN_AT).toInstant(ZoneOffset.UTC);
+
+            open.merge(
+                    discrepancy.kind().name() + "\u0000" + discrepancy.subject(),
+                    new OpenFinding(discrepancy, ranAt, runId, ranAt, runId, 1),
+                    // Rows arrive oldest first, so the incoming one is always the newer:
+                    // its detail and amounts win, and the first sighting is kept.
+                    (older, newer) -> new OpenFinding(
+                            newer.latest(),
+                            older.firstSeen(),
+                            older.firstSeenRun(),
+                            newer.lastSeen(),
+                            newer.lastSeenRun(),
+                            older.timesReported() + 1));
+        }
+
+        List<OpenFinding> sorted = open.values().stream()
+                .sorted(Comparator.comparing((OpenFinding f) -> f.kind().name())
+                        .thenComparing(OpenFinding::subject))
+                .toList();
+
+        return Optional.of(new OpenFindings(
+                anchorId, anchorAt.toInstant(ZoneOffset.UTC), sorted));
     }
 
     public Optional<ReconciliationReport> latest() {

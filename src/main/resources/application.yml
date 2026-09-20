@@ -40,6 +40,14 @@ ledger:
     confirmations: ${LEDGER_CHAIN_CONFIRMATIONS:12}
     # How often the chain is read. Shorter than a block time buys nothing.
     poll-interval: ${LEDGER_CHAIN_POLL_INTERVAL:PT15S}
+    # The block the escrow was deployed in. Nothing below it can hold a deposit into a
+    # contract that did not exist, and a watcher starting with an empty cursor would
+    # otherwise ask for every log since genesis: refused outright by a hosted provider,
+    # and slow enough on a node of your own to look like a hang. Zero is right only for a
+    # chain created for the occasion.
+    deployed-at-block: ${LEDGER_CHAIN_DEPLOYED_AT_BLOCK:0}
+    # The widest range one eth_getLogs may cover. Ten thousand is the usual provider cap.
+    max-block-span: ${LEDGER_CHAIN_MAX_BLOCK_SPAN:10000}
 
   reconciliation:
     # Off only for tests that share a database with other tests, where a background run

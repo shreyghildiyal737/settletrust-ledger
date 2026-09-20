@@ -126,6 +126,12 @@
             starter parent sets it; this project uses the BOM instead, so it sets it here.
           -->
           <parameters>true</parameters>
+          <!--
+            Lint on, minus serial: the only classes it fires on are exceptions that are
+            never serialised, and a serialVersionUID on each of them would be four lines
+            of ceremony that mean nothing.
+          -->
+          <compilerArgs><arg>-Xlint:all,-serial</arg></compilerArgs>
         </configuration>
       </plugin>
       <plugin>

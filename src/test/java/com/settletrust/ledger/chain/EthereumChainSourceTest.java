@@ -184,6 +184,59 @@ class EthereumChainSourceTest {
     }
 
     @Test
+    @DisplayName("nothing before the contract existed is asked for")
+    void theScanStartsWhereTheContractWasDeployed() {
+        long deployedAt = chain.headBlockNumber();
+        fund(anInvoiceId(), AMOUNT);
+
+        EthereumChainSource floored =
+                new EthereumChainSource(chain.rpc(), escrow, "USDC", deployedAt, 10_000);
+
+        assertAll(
+                () -> assertEquals(1, floored.depositsFrom(0).size(),
+                        "a cursor at zero must still find the deposit, from the floor"),
+                () -> assertEquals(1, deposits.depositsFrom(0).size(),
+                        "and the unfloored source agrees about what is there"));
+    }
+
+    @Test
+    @DisplayName("a range wider than one call may cover is paged, not truncated")
+    void aWideRangeIsPaged() {
+        fund(anInvoiceId(), AMOUNT);
+        chain.mineEmpty(8);
+        fund(anInvoiceId(), AMOUNT);
+        chain.mineEmpty(8);
+
+        // One block per call, so the scan has to page many times to reach the head. A
+        // client that asked once and stopped would see the first deposit and miss the
+        // second, which is what a provider's block-span cap does to an unpaged one.
+        EthereumChainSource paged =
+                new EthereumChainSource(chain.rpc(), escrow, "USDC", 0, 1);
+
+        assertEquals(2, paged.depositsFrom(0).size(),
+                () -> "paging lost a deposit: " + paged.depositsFrom(0));
+    }
+
+    @Test
+    @DisplayName("a token address with no ERC-20 behind it says so")
+    void aMisconfiguredTokenAddressIsNamed() {
+        // An ordinary account, holding no code. eth_call against it does not fail: there
+        // is nothing to run, so it returns empty, and the empty answer would otherwise
+        // become a hex parsing error several frames from the setting that caused it.
+        // (An address that does hold code but has no balanceOf reverts instead, and the
+        // node's own refusal already says so.)
+        EscrowContractReserves misconfigured =
+                new EscrowContractReserves(chain.rpc(), chain.account(5), escrow, "USDC");
+
+        JsonRpc.ChainUnavailable refused =
+                assertThrows(JsonRpc.ChainUnavailable.class, misconfigured::heldOnChain);
+
+        assertTrue(refused.getMessage().contains("token-address"),
+                () -> "the message should point at the setting to fix: "
+                        + refused.getMessage());
+    }
+
+    @Test
     @DisplayName("an invoice id too long for the contract is refused rather than truncated")
     void anOversizedInvoiceIdIsRefused() {
         String tooLong = "inv-" + "x".repeat(30);

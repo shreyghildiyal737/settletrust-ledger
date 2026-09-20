@@ -283,6 +283,15 @@ and drive them; without it they skip, because a missing toolchain says nothing a
 ledger. Transactions are sent against anvil's own unlocked accounts, which is why no
 signing code exists anywhere in this repository, including the tests.
 
+Two things the local chain hid until they were looked for. The watcher's cursor starts
+at -1, so a first scan asked for every log since **genesis**: fine on a chain made for the
+occasion, refused outright by every hosted provider, and slow enough on a node of your own
+to look like a hang. The source is now floored at the block the escrow was deployed in,
+since nothing below it can hold a deposit into a contract that did not exist. And a single
+`eth_getLogs` is capped at ten thousand blocks by the common providers, so the scan pages
+to a head read once rather than asking for `latest` on every page: paging to a moving
+target would return a set of logs belonging to no single height.
+
 **Status, honestly:** the contract compiles, deploys and runs, and the rail has been
 driven end to end against a real node: deposited on chain, credited by the watcher, and
 the resulting books checked by the reconciler against the token contract's own balance.
@@ -421,6 +430,36 @@ one thing an incremental run cannot do is notice a fault in history it has alrea
 so "the last run was clean" is a statement about a window. Only the last full run is a
 statement about the ledger.
 
+### What is wrong now
+
+Which is why a report is the wrong thing to hang an alert on. A report answers "what did
+that pass find", and once passes became windowed, a fault found once and never fixed stops
+appearing in later reports: the run that found it moves on, the next window has no reason
+to look at that account again, and `runs/latest` goes quiet while the money is still
+missing.
+
+`GET /api/v1/reconciliation/findings/open` answers the other question. A finding is
+identified by kind and subject together, so the same overdrawn account found by six
+consecutive runs is one thing wrong rather than six, carrying when it was first seen, when
+it was last seen and how many runs have reported it.
+
+**Only a full run can close a finding.** An incremental run looked at a window, so its
+silence about a subject means it did not look, not that the subject is well. The open set
+is therefore anchored on the most recent full run: everything that run found, plus
+everything found by any run after it. A fault the anchor did not report is one that a pass
+which looked everywhere failed to find, and that is the only evidence of a fix this system
+accepts. The anchor's id and time are returned with the answer, because they bound it: if
+the last deep run was yesterday, so is the assurance that anything missing from the list
+is genuinely fixed.
+
+Nothing is stored for this. It is a query over the same append-only runs and findings, and
+that is deliberate: a table of open findings would be a second record of the same facts,
+kept by the same code, free to drift from the evidence it summarises. This cannot drift,
+because it is that evidence read differently.
+
+Nothing reconciled yet answers 404 rather than an empty list. "No open findings" and
+"nobody has looked" must not read alike.
+
 **Nothing here repairs anything.** A reconciler that silently corrects what it finds
 destroys the evidence of how the books came to be wrong, and the second occurrence then
 looks like the first.
@@ -467,6 +506,7 @@ at.
 | `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
 | `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `mode` and `reservesChecked` saying what it covered and whether the chain was asked. `?deep=true` re-derives the whole book instead of the window since the last run, which is what to reach for in an incident. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
+| `GET /api/v1/reconciliation/findings/open` | What is still wrong, anchored on the last full run, with each finding's first and last sighting. The endpoint an alert should point at: `runs/latest` answers for a window. 404 when nothing has ever been reconciled, which is not the same as nothing being wrong. |
 
 ```http
 POST /api/v1/transfers
@@ -631,6 +671,12 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A deposit reversed after it was checked is examined again | same |
 | A carried total the entries do not support is itself a finding | same |
 | A transaction that commits out of order is not passed over | same |
+| Nothing reconciled yet is not the same answer as nothing wrong | `ReconcilerTest.StillOpen` |
+| A fault a deep run found is open, and dated from when it found it | same |
+| A fault a window found stays open after later windows pass it by | same |
+| A fault seen by several runs is one finding, counted | same |
+| A fault a deep run no longer finds is closed | same |
+| Only a deep run closes anything, because only it looked everywhere | same |
 | A deposit is read back from a real node as the chain reported it | `EthereumChainSourceTest` |
 | The block hash on a deposit is the hash of the block it landed in | same |
 | The right log is picked out of a transaction that emitted several | same |
@@ -638,6 +684,9 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | The reserve check reads the token's balance, not the escrow's own opinion | same |
 | Money sent straight to the contract counts, and is what a surplus is made of | same |
 | An invoice id too long for the contract is refused rather than truncated | same |
+| Nothing before the contract existed is asked for | same |
+| A range wider than one call may cover is paged, not truncated | same |
+| A token address with no ERC-20 behind it says so | same |
 | Money paid on chain funds a real invoice, once it is deep enough | `OnChainRailTest` |
 | A second pass over the same chain credits nothing twice | same |
 | The reconciler verifies the books against the real token contract | same |
@@ -656,6 +705,7 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | Each status reports exactly what it is waiting on, across eleven | same |
 | A run is 201 whatever it found, and is the one `latest` returns | `ReconciliationApiTest` |
 | `deep=true` re-derives the book rather than the window | same |
+| The open findings say what they are anchored on | same |
 
 ```bash
 mvn test
@@ -683,9 +733,15 @@ deployed, driven end to end against a local node and given its own suite; it has
 been on a public network and has **not been audited**, which is a different and larger
 claim than "the tests pass".
 
-**Next:** a findings feed an operator can subscribe to. Runs and findings are stored and
-readable one at a time; what is missing is "what is open right now", which an incremental
-run cannot answer on its own, because a fault it reported once and nobody fixed does not
-reappear in later windows.
+**Next:** the open findings are readable and nothing pushes them. An operator still has
+to poll an endpoint to learn that money has gone missing, which is the wrong way round.
+Somewhere to send them is the next piece, and choosing it is a question about how this
+would actually be run rather than about the ledger.
+
+Two things are worth saying plainly rather than leaving to be discovered. The Kubernetes
+manifests are verified with `kubeconform` and the probe split was tested against a
+throwaway Postgres, but **nothing here has been applied to a real cluster**. And the
+escrow contract has never been on a public network and has **not been audited**, which is
+a larger claim than the tests passing.
 
 One ledger, two settlement rails.
