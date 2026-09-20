@@ -55,6 +55,8 @@ contract InvoiceEscrow is ReentrancyGuard {
     error NothingHeld();
     error AlreadyClosed();
     error ZeroAmount();
+    /// @dev The token moved less than it was told to. See {deposit}.
+    error AmountNotReceived();
     error ZeroAddress();
 
     modifier onlySettler() {
@@ -75,9 +77,16 @@ contract InvoiceEscrow is ReentrancyGuard {
      *      several events to know what is held, and a partial payment is a commercial
      *      conversation rather than something to resolve in a contract.
      *
-     *      The transfer happens before the event so that a token which fails, or which
-     *      takes a fee and delivers less than `amount`, cannot produce a log the watcher
-     *      would believe. SafeERC20 turns a non-reverting failure into a revert.
+     *      The watcher credits an invoice from the event, so the event must never say more
+     *      than arrived. SafeERC20 turns a non-reverting failure into a revert, and that
+     *      is not enough on its own: a fee-on-transfer token succeeds, returns true and
+     *      delivers less than `amount`, which would leave the contract asserting a balance
+     *      it does not have and the ledger crediting money nobody can be paid. So the
+     *      balance is measured either side of the transfer and a shortfall is refused.
+     *
+     *      Refused rather than recorded at the amount actually received, because the
+     *      contract already holds that a partial payment is a commercial conversation and
+     *      not something to resolve here.
      */
     function deposit(bytes32 invoiceId, address seller, uint256 amount) external nonReentrant {
         if (amount == 0) revert ZeroAmount();
@@ -90,7 +99,9 @@ contract InvoiceEscrow is ReentrancyGuard {
         escrow.seller = seller;
         escrow.amount = amount;
 
+        uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
+        if (token.balanceOf(address(this)) - balanceBefore != amount) revert AmountNotReceived();
 
         emit EscrowDeposited(invoiceId, msg.sender, seller, amount);
     }

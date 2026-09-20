@@ -227,6 +227,22 @@ refuses an amount that will not fit rather than truncating it. In practice that 
 the contract is pointed at a token with eighteen decimals, which is a misconfiguration
 worth stopping on.
 
+**What the contract's own tests found.** `deposit` used to call
+`SafeERC20.safeTransferFrom` and then emit the requested amount. SafeERC20 reverts on a
+transfer that fails and says nothing about one that succeeds for less than it was asked,
+which is exactly what a fee-on-transfer token does: the transfer returns true and the
+recipient is short. The escrow recorded the requested amount, the event carried it, and
+the watcher would have credited an invoice for money that was never in the contract. A
+deposit of 2,500,000 against a token skimming 3% left the contract asserting 2,500,000 and
+holding 2,425,000.
+
+The comment above `deposit` claimed this could not happen, which is the more interesting
+half: the reasoning was written down, was wrong, and nothing had ever executed the code to
+disagree with it. `deposit` now measures the balance either side of the transfer and
+refuses a shortfall, rather than recording what actually arrived, because the contract
+already holds that a partial payment is a commercial conversation and not something to
+settle here.
+
 The reserve check asks the **token** for `balanceOf(escrow)`, not the escrow for its own
 total. A `totalHeld()` getter on `InvoiceEscrow` would have been easier to call and
 worthless to trust: it would be the escrow's own bookkeeping, which is the kind of thing
@@ -249,9 +265,15 @@ git clone --depth 1 --branch v5.1.0 \
 docker run --rm -v "$PWD:/work" -w /work ghcr.io/foundry-rs/foundry:latest "forge build"
 ```
 
-On Windows under git bash, prefix the mounting command with `MSYS_NO_PATHCONV=1` and give
-the host path as `C:/...`, or the shell rewrites it into something Docker reads as a
-volume name.
+The contract's own tests run the same way:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work ghcr.io/foundry-rs/foundry:latest "forge test"
+```
+
+On Windows under git bash, prefix any of these mounting commands with `MSYS_NO_PATHCONV=1`
+and give the host path as `C:/...`, or the shell rewrites it into something Docker reads
+as a volume name.
 
 `contracts/lib` and `contracts/out` are ignored: vendoring the whole of OpenZeppelin would
 bury the twenty lines that are actually ours.
@@ -620,6 +642,14 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | A second pass over the same chain credits nothing twice | same |
 | The reconciler verifies the books against the real token contract | same |
 | A contract short of what the ledger credited is caught against a real node | same |
+| A deposit moves the money and says so | `InvoiceEscrow.t.sol` |
+| One deposit per invoice, and none for nothing or for nobody | same |
+| A release pays the seller, and a refund repays the buyer | same |
+| Only the settler may release or refund | same |
+| The money leaves once, by whichever of the four routes | same |
+| An escrow that was never funded holds nothing | same |
+| The contract refuses to be deployed without a settler or a token | same |
+| A fee-taking token cannot make the contract overstate what it holds | same |
 | A status is final exactly when it has nowhere left to go | `InvoiceLifecycleSpec` |
 | Every status is reachable from a draft, so none is stranded | same |
 | Each illegal move carries the reason it deserves, across nine cases | same |
@@ -649,17 +679,13 @@ generated from those migrations, the HTTP API, the invoice lifecycle, escrow fun
 settlement, the on-chain deposit rail with its reorg handling, reconciliation from a
 watermark with its periodic full sweep, the schedule and lease, the Ethereum client and
 the escrow contract it reads, and the tests above. The contract has been compiled,
-deployed and driven end to end against a local node; it has never been on a public
-network and has not been audited.
+deployed, driven end to end against a local node and given its own suite; it has never
+been on a public network and has **not been audited**, which is a different and larger
+claim than "the tests pass".
 
-**Next, in order:**
-
-1. Forge tests for `InvoiceEscrow` itself. It is exercised end to end now, which proves
-   the happy path and nothing about a release by somebody who is not the settler, a
-   double refund, or a token that takes a fee.
-2. A findings feed an operator can subscribe to. Runs and findings are stored and
-   readable one at a time; what is missing is "what is open right now", which an
-   incremental run cannot answer on its own because a fault it reported once and nobody
-   fixed does not reappear in later windows.
+**Next:** a findings feed an operator can subscribe to. Runs and findings are stored and
+readable one at a time; what is missing is "what is open right now", which an incremental
+run cannot answer on its own, because a fault it reported once and nobody fixed does not
+reappear in later windows.
 
 One ledger, two settlement rails.
