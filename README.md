@@ -249,6 +249,10 @@ git clone --depth 1 --branch v5.1.0 \
 docker run --rm -v "$PWD:/work" -w /work ghcr.io/foundry-rs/foundry:latest "forge build"
 ```
 
+On Windows under git bash, prefix the mounting command with `MSYS_NO_PATHCONV=1` and give
+the host path as `C:/...`, or the shell rewrites it into something Docker reads as a
+volume name.
+
 `contracts/lib` and `contracts/out` are ignored: vendoring the whole of OpenZeppelin would
 bury the twenty lines that are actually ours.
 
