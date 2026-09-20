@@ -4,9 +4,9 @@ import com.settletrust.ledger.reconciliation.Discrepancy;
 import com.settletrust.ledger.reconciliation.OpenFindings;
 import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
 import com.settletrust.ledger.reconciliation.ReconciliationReport;
+import com.settletrust.ledger.reconciliation.RunMode;
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
-import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -53,12 +53,12 @@ class ReconciliationMetrics {
     private final MeterRegistry registry;
 
     ReconciliationMetrics(
-            MeterRegistry registry, Clock clock, PostgresReconciliationRuns runs, DSLContext dsl) {
+            MeterRegistry registry, Clock clock, PostgresReconciliationRuns runs) {
 
         this.registry = registry;
         this.clock = clock;
 
-        primeFromTheRecord(runs, dsl);
+        primeFromTheRecord(runs);
 
         Gauge.builder("settletrust.reconciliation.open.findings", openFindings,
                         holder -> holder.get() < 0 ? Double.NaN : holder.get())
@@ -85,7 +85,7 @@ class ReconciliationMetrics {
      * service is unwell, and refusing to start because they could not be primed gets that
      * backwards.
      */
-    private void primeFromTheRecord(PostgresReconciliationRuns runs, DSLContext dsl) {
+    private void primeFromTheRecord(PostgresReconciliationRuns runs) {
         try {
             runs.openFindings().ifPresent(open -> {
                 openFindings.set(open.findings().size());
@@ -99,13 +99,12 @@ class ReconciliationMetrics {
         }
     }
 
-    /** Called by the schedule after a run, so the gauges change when the answer does. */
-    void record(ReconciliationReport report, OpenFindings open) {
+    /** Called by the schedule after every run that happened. */
+    void recordRun(ReconciliationReport report) {
         lastRun.set(report.ranAt());
-        if (report.mode() == com.settletrust.ledger.reconciliation.RunMode.FULL) {
+        if (report.mode() == RunMode.FULL) {
             lastFullRun.set(report.ranAt());
         }
-        openFindings.set(open.findings().size());
 
         registry.counter("settletrust.reconciliation.runs",
                         "mode", report.mode().name().toLowerCase(),
@@ -119,6 +118,11 @@ class ReconciliationMetrics {
                             "kind", discrepancy.kind().name().toLowerCase())
                     .increment();
         }
+    }
+
+    /** The standing total, which is a question about every run since the last full one. */
+    void recordOpen(OpenFindings open) {
+        openFindings.set(open.findings().size());
     }
 
     /** A run that never happened, because another instance held the lease. */

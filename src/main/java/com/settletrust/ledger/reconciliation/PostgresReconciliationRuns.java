@@ -181,7 +181,18 @@ public class PostgresReconciliationRuns {
         // The anchor run and everything after it. Two runs recorded in the same instant are
         // separated by the same id tiebreak the rest of this class orders by, so the cut is
         // exactly the one "the newest full run" names and not a second either side of it.
-        Result<Record> reports = dsl.select()
+        // Columns named rather than select(): reconciliation_run and
+        // reconciliation_finding both have an `id`, and a bare select leaves which one
+        // wins to field-identity resolution that a later edit could quietly break.
+        Result<? extends Record> reports = dsl.select(
+                        RECONCILIATION_RUN.ID,
+                        RECONCILIATION_RUN.RAN_AT,
+                        RECONCILIATION_FINDING.KIND,
+                        RECONCILIATION_FINDING.SUBJECT,
+                        RECONCILIATION_FINDING.DETAIL,
+                        RECONCILIATION_FINDING.EXPECTED_MINOR,
+                        RECONCILIATION_FINDING.FOUND_MINOR,
+                        RECONCILIATION_FINDING.CURRENCY)
                 .from(RECONCILIATION_FINDING)
                 .join(RECONCILIATION_RUN)
                 .on(RECONCILIATION_RUN.ID.eq(RECONCILIATION_FINDING.RUN_ID))

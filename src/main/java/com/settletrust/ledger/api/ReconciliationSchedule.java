@@ -67,9 +67,12 @@ class ReconciliationSchedule {
         }
 
         ReconciliationReport report = completed.get();
+        metrics.recordRun(report);
         // Read back rather than derived from this report alone: what is open is a question
         // about every run since the last full one, and this run is only the newest of them.
-        runs.openFindings().ifPresent(open -> metrics.record(report, open));
+        // Kept apart from the counter above so a run is always counted, even if this read
+        // ever comes back empty.
+        runs.openFindings().ifPresent(metrics::recordOpen);
         if (report.agreed()) {
             // The mode is logged with the counts because it is what they mean. Two
             // deposits checked by a full run is a two-deposit book; two checked by an
