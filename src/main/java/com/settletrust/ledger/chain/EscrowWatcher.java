@@ -36,19 +36,44 @@ public class EscrowWatcher {
     private final PostgresChainObservations observations;
     private final InvoiceSettlement settlement;
     private final int confirmations;
+    private final int finalityDepth;
 
     public EscrowWatcher(
             DSLContext dsl,
             PostgresChainObservations observations,
             InvoiceSettlement settlement,
             int confirmations) {
+        this(dsl, observations, settlement, confirmations, confirmations * 4);
+    }
+
+    /**
+     * @param confirmations how deep a deposit must be buried before it is credited
+     * @param finalityDepth how deep a deposit must be buried before the chain stops being
+     *     asked about it at all. Past this point an observation is treated as settled
+     *     history: a reorganisation that reached further back than this would already have
+     *     invalidated the bet that {@code confirmations} was deep enough to credit on, so
+     *     re-checking for ever buys nothing and costs one request per deposit per pass,
+     *     for every deposit the platform has ever taken.
+     */
+    public EscrowWatcher(
+            DSLContext dsl,
+            PostgresChainObservations observations,
+            InvoiceSettlement settlement,
+            int confirmations,
+            int finalityDepth) {
         this.dsl = Objects.requireNonNull(dsl, "dsl must not be null");
         this.observations = Objects.requireNonNull(observations, "observations must not be null");
         this.settlement = Objects.requireNonNull(settlement, "settlement must not be null");
         if (confirmations < 1) {
             throw new IllegalArgumentException("confirmations must be at least 1");
         }
+        if (finalityDepth < confirmations) {
+            throw new IllegalArgumentException(
+                    "finalityDepth must be at least confirmations, or a deposit would be "
+                            + "treated as final before it was deep enough to credit");
+        }
         this.confirmations = confirmations;
+        this.finalityDepth = finalityDepth;
     }
 
     /** What one pass over the chain did. */
@@ -71,18 +96,30 @@ public class EscrowWatcher {
      * idempotent or recorded in the same transaction as its effect.
      */
     public PollResult poll(ChainSource chain) {
+        // Read once, and it is the only head this pass uses. Every range scanned, every
+        // depth computed and the cursor finally written all refer to this one number, so
+        // there is no second horizon for a block to fall between.
         long head = chain.headBlockNumber();
 
-        // Deliberately re-reads the last few blocks rather than continuing exactly where it
+        // Deliberately re-reads the last stretch rather than continuing exactly where it
         // stopped. A reorganisation moves events into different blocks, and an event that
         // came back somewhere else would otherwise be behind the cursor and never seen
         // again. Re-reading is free because recording is idempotent.
-        long from = Math.max(0, observations.lastBlockRead() + 1 - confirmations);
+        //
+        // The rewind is the finality depth and not the confirmation depth, and that is the
+        // load-bearing part. The cursor is only a hint about where to start; what actually
+        // stops a deposit being lost is that the next pass begins far enough back to cover
+        // any reorganisation this service is willing to believe in. Rewinding by
+        // confirmations tied those two together for no reason, and at a confirmation depth
+        // of one it left a window one block wide: the chain shortens between reading the
+        // head and reading the logs, the blocks that replace it are never scanned, and the
+        // deposits in them are lost for good.
+        long from = Math.max(0, observations.lastBlockRead() + 1 - finalityDepth);
 
         int recorded = 0;
         int reanchored = 0;
         int unattributed = 0;
-        for (ChainDeposit deposit : chain.depositsFrom(from)) {
+        for (ChainDeposit deposit : chain.depositsFrom(from, head)) {
             switch (observations.recordIfNew(deposit)) {
                 case RECORDED -> recorded++;
                 case UNKNOWN_INVOICE -> {
@@ -103,9 +140,10 @@ public class EscrowWatcher {
                 }
             }
         }
+        // Safe to write only because the scan above was bounded by this same head.
         observations.rememberBlockRead(head);
 
-        int reversed = reverseWhatTheChainTookBack(chain);
+        int reversed = reverseWhatTheChainTookBack(chain, head);
         Promotions promotions = promoteWhatIsBuriedDeepEnough(chain, head);
 
         return new PollResult(
@@ -119,10 +157,12 @@ public class EscrowWatcher {
                 unattributed);
     }
 
-    private int reverseWhatTheChainTookBack(ChainSource chain) {
+    private int reverseWhatTheChainTookBack(ChainSource chain, long head) {
         int reversed = 0;
-        for (ChainObservation observation : observations.withStatus(ObservationStatus.CONFIRMED)) {
-            if (stillCanonical(chain, observation)) {
+        long oldestWorthAsking = head - finalityDepth;
+        for (ChainObservation observation
+                : observations.withStatusAtOrAbove(ObservationStatus.CONFIRMED, oldestWorthAsking)) {
+            if (stillCanonical(chain, observation, head)) {
                 continue;
             }
 
@@ -149,7 +189,11 @@ public class EscrowWatcher {
         int abandoned = 0;
 
         for (ChainObservation observation : observations.withStatus(ObservationStatus.PENDING)) {
-            if (!stillCanonical(chain, observation)) {
+            // Past the finality depth the chain is not asked again, for the same reason the
+            // reversal sweep stops there. A pending observation that old is waiting on this
+            // platform, not on the chain: its invoice was not ready to be funded.
+            boolean settledHistory = observation.depth(head) > finalityDepth;
+            if (!settledHistory && !stillCanonical(chain, observation, head)) {
                 // Dropped before it was ever credited, so there is nothing to undo.
                 observations.mark(observation, ObservationStatus.ABANDONED);
                 abandoned++;
@@ -184,10 +228,30 @@ public class EscrowWatcher {
         return new Promotions(confirmed, deferred, abandoned);
     }
 
-    private static boolean stillCanonical(ChainSource chain, ChainObservation observation) {
-        return chain.blockHashAt(observation.blockNumber())
-                .map(hash -> hash.equals(observation.blockHash()))
-                .orElse(false);
+    /**
+     * Whether the block this deposit was seen in is still the block at that height.
+     *
+     * <p>A reversal moves money, so it is made only on positive evidence. There are two
+     * ways to have none. If the height is above the head, the chain really has become
+     * shorter and the block is genuinely gone: that is a reorganisation and reversing is
+     * right. But if the node claims a head at or above this height and still has no block
+     * there, it is contradicting itself, most likely mid re-sync. Treating that silence as
+     * a reorganisation would reverse confirmed deposits the chain never took back, so it
+     * is raised instead and the pass is retried on the next tick.
+     */
+    private static boolean stillCanonical(
+            ChainSource chain, ChainObservation observation, long head) {
+
+        if (observation.blockNumber() > head) {
+            return false;
+        }
+        String canonical = chain.blockHashAt(observation.blockNumber())
+                .orElseThrow(() -> new JsonRpc.ChainUnavailable(
+                        "the node reports head " + head + " but has no block at "
+                                + observation.blockNumber() + ", so it cannot be asked "
+                                + "whether deposit " + observation.txHash() + ":"
+                                + observation.logIndex() + " was taken back"));
+        return canonical.equals(observation.blockHash());
     }
 
     private record Promotions(int confirmed, int deferred, int abandoned) {

@@ -83,7 +83,7 @@ class EthereumChainSourceTest {
         String txHash = fund(invoiceId, AMOUNT);
         long landedIn = Hex.toLong(chain.receiptOf(txHash).get("blockNumber").asText());
 
-        List<ChainDeposit> found = deposits.depositsFrom(0);
+        List<ChainDeposit> found = deposits.depositsFrom(0, deposits.headBlockNumber());
 
         assertAll(
                 () -> assertEquals(1, found.size(), () -> "expected one deposit, got " + found),
@@ -114,7 +114,7 @@ class EthereumChainSourceTest {
     @DisplayName("the block hash on a deposit is the hash of the block it landed in")
     void theBlockHashIsTheBlocksOwn() {
         fund(anInvoiceId(), AMOUNT);
-        ChainDeposit deposit = deposits.depositsFrom(0).getFirst();
+        ChainDeposit deposit = deposits.depositsFrom(0, deposits.headBlockNumber()).getFirst();
 
         assertAll(
                 () -> assertEquals(deposit.blockHash(),
@@ -148,7 +148,7 @@ class EthereumChainSourceTest {
         chain.mint(token, buyer, AMOUNT);
         chain.deposit(other, buyer, theirs, seller, AMOUNT);
 
-        List<ChainDeposit> found = deposits.depositsFrom(0);
+        List<ChainDeposit> found = deposits.depositsFrom(0, deposits.headBlockNumber());
 
         assertAll(
                 () -> assertEquals(1, found.size(),
@@ -179,7 +179,7 @@ class EthereumChainSourceTest {
 
         assertAll(
                 () -> assertEquals(List.of(Money.of(AMOUNT + 7L, "USDC")), reserves.heldOnChain(chain.headBlockNumber())),
-                () -> assertEquals(1, deposits.depositsFrom(0).size(),
+                () -> assertEquals(1, deposits.depositsFrom(0, deposits.headBlockNumber()).size(),
                         "and the watcher rightly knows nothing about it"));
     }
 
@@ -193,9 +193,9 @@ class EthereumChainSourceTest {
                 new EthereumChainSource(chain.rpc(), escrow, "USDC", deployedAt, 10_000);
 
         assertAll(
-                () -> assertEquals(1, floored.depositsFrom(0).size(),
+                () -> assertEquals(1, floored.depositsFrom(0, floored.headBlockNumber()).size(),
                         "a cursor at zero must still find the deposit, from the floor"),
-                () -> assertEquals(1, deposits.depositsFrom(0).size(),
+                () -> assertEquals(1, deposits.depositsFrom(0, deposits.headBlockNumber()).size(),
                         "and the unfloored source agrees about what is there"));
     }
 
@@ -213,8 +213,8 @@ class EthereumChainSourceTest {
         EthereumChainSource paged =
                 new EthereumChainSource(chain.rpc(), escrow, "USDC", 0, 1);
 
-        assertEquals(2, paged.depositsFrom(0).size(),
-                () -> "paging lost a deposit: " + paged.depositsFrom(0));
+        assertEquals(2, paged.depositsFrom(0, paged.headBlockNumber()).size(),
+                () -> "paging lost a deposit: " + paged.depositsFrom(0, paged.headBlockNumber()));
     }
 
     @Test

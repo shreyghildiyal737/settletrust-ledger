@@ -46,7 +46,7 @@ class LedgerController {
     @PostMapping("/accounts")
     ResponseEntity<AccountView> openAccount(@Valid @RequestBody OpenAccountRequest request) {
         Account account = fromClient(() -> new Account(
-                AccountId.of(request.id()), request.currency(), request.resolvedKind()));
+                AccountId.external(request.id()), request.currency(), request.resolvedKind()));
         ledger.open(account);
         return ResponseEntity
                 .status(HttpStatus.CREATED)
@@ -85,8 +85,13 @@ class LedgerController {
             throw new MalformedRequest("Idempotency-Key must not be blank");
         }
 
-        AccountId from = fromClient(() -> AccountId.of(request.from()));
-        AccountId to = fromClient(() -> AccountId.of(request.to()));
+        // Reserved on both sides, and the paying side is the one that matters. An escrow
+        // account holds one invoice's money and is emptied by settling that invoice, which
+        // writes the transition proving why the money moved. A generic transfer naming it
+        // as the payer would move the same money with no invoice behind it, leaving the
+        // lifecycle claiming an escrow that is no longer there.
+        AccountId from = fromClient(() -> AccountId.external(request.from()));
+        AccountId to = fromClient(() -> AccountId.external(request.to()));
         Money amount = fromClient(() -> Money.of(request.amountMinor(), request.currency()));
 
         Transfer transfer = transfers.transfer(from, to, amount, idempotencyKey);

@@ -121,7 +121,8 @@ final class Anvil implements AutoCloseable {
 
     /** Mines empty blocks, which is how a test buries a deposit deep enough to confirm. */
     void mineEmpty(int count) {
-        rpc.call("anvil_mine", Hex.quantity(count));
+        // anvil_mine answers null on success: it is an instruction, not a question.
+        rpc.callAllowingNull("anvil_mine", Hex.quantity(count));
     }
 
     long headBlockNumber() {
@@ -143,7 +144,9 @@ final class Anvil implements AutoCloseable {
     JsonNode receiptOf(String txHash) {
         long giveUpAt = System.nanoTime() + MINING_PATIENCE.toNanos();
         while (true) {
-            JsonNode receipt = rpc.call("eth_getTransactionReceipt", txHash);
+            // Null while the transaction is still pending, which is the whole reason
+            // this polls. That is an answer, not a silence.
+            JsonNode receipt = rpc.callAllowingNull("eth_getTransactionReceipt", txHash);
             if (!receipt.isNull()) {
                 if (!"0x1".equals(receipt.get("status").asText())) {
                     throw new IllegalStateException("transaction " + txHash + " reverted");

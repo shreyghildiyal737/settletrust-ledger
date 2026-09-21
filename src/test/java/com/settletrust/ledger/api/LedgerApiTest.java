@@ -69,6 +69,38 @@ class LedgerApiTest {
         transfer(house, alice, 10_000L, "EUR", "seed-" + run).andExpect(status().isCreated());
     }
 
+    /**
+     * The platform's own account namespaces are not a naming convention. Reconciliation
+     * recognises an escrow or a chain account by its prefix and by nothing else, so an
+     * outside caller able to open {@code escrow:something} is able to have money it
+     * controls counted as escrow the platform is holding.
+     */
+    @Test
+    @DisplayName("an account cannot be opened in a namespace the platform reserves")
+    void reservedPrefixesCannotBeClaimed() throws Exception {
+        attemptOpenAccount("escrow:inv-" + UUID.randomUUID(), "EUR", "CUSTOMER")
+                .andExpect(status().isBadRequest());
+        attemptOpenAccount("chain:EUR", "EUR", "HOUSE")
+                .andExpect(status().isBadRequest());
+        attemptOpenAccount("chain-shortfall:EUR", "EUR", "HOUSE")
+                .andExpect(status().isBadRequest());
+    }
+
+    /**
+     * The worse half of the same hole. An escrow account is emptied by settling its
+     * invoice, which writes the transition saying why the money moved. A generic transfer
+     * naming it as the payer moves the same money with no invoice behind it, leaving the
+     * lifecycle insisting on an escrow that is no longer funded.
+     */
+    @Test
+    @DisplayName("the generic transfer endpoint will not pay out of a platform account")
+    void reservedAccountsCannotBeDrainedByAGenericTransfer() throws Exception {
+        transfer("escrow:inv-whatever", bob, 1_000L, "EUR", key())
+                .andExpect(status().isBadRequest());
+        transfer(alice, "chain:EUR", 1_000L, "EUR", key())
+                .andExpect(status().isBadRequest());
+    }
+
     @Test
     @DisplayName("a new transfer is 201 and moves the balances")
     void aNewTransferIsCreated() throws Exception {
@@ -179,11 +211,16 @@ class LedgerApiTest {
     }
 
     private void openAccount(String id, String currency, String kind) throws Exception {
-        mvc.perform(post("/api/v1/accounts")
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(json.writeValueAsString(
-                                Map.of("id", id, "currency", currency, "kind", kind))))
-                .andExpect(status().isCreated());
+        attemptOpenAccount(id, currency, kind).andExpect(status().isCreated());
+    }
+
+    /** Opens an account without insisting it worked, for the cases where it must not. */
+    private org.springframework.test.web.servlet.ResultActions attemptOpenAccount(
+            String id, String currency, String kind) throws Exception {
+        return mvc.perform(post("/api/v1/accounts")
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(
+                        Map.of("id", id, "currency", currency, "kind", kind))));
     }
 
     private org.springframework.test.web.servlet.ResultActions transfer(

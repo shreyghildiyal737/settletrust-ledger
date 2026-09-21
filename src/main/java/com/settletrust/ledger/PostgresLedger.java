@@ -49,11 +49,13 @@ public class PostgresLedger {
     }
 
     /**
-     * True if the account exists, so a caller can open it only when it does not. Used for
-     * per-invoice escrow accounts, which come into being the first time one is funded.
+     * The account as it stands inside a transaction the caller already owns, if it is
+     * there at all. Used for per-invoice escrow accounts, which come into being the first
+     * time one is funded; the caller needs the account itself rather than a yes or no, so
+     * that an id already in use can be checked against what it was about to open.
      */
-    public boolean exists(Configuration config, AccountId id) {
-        return find(DSL.using(config), id).isPresent();
+    public Optional<Account> findWithin(Configuration config, AccountId id) {
+        return find(DSL.using(config), id);
     }
 
     private void open(DSLContext context, Account account) {

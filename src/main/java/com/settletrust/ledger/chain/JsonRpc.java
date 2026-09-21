@@ -56,14 +56,46 @@ public class JsonRpc implements AutoCloseable {
     }
 
     /**
-     * Makes one call and returns its {@code result}.
+     * Makes one call and returns its {@code result}, refusing a null one.
      *
      * <p>A JSON-RPC error is thrown rather than returned. Every call here asks a question
      * whose answer the caller cannot proceed without, so there is no branch that would
      * usefully inspect an error code; a watcher that carried on with a null would write
      * the absence of a deposit into the ledger as though it were a fact.
+     *
+     * <p>"Refusing a null one" means both shapes of null, and the distinction is the
+     * whole point: an absent {@code result} key is a malformed reply, while a present
+     * {@code result} holding JSON {@code null} is well-formed and still says nothing.
+     * Jackson hands back a Java {@code null} for the first and a {@code NullNode} for the
+     * second, and a {@code NullNode} iterates as an empty list, so a node answering
+     * {@code "result": null} to {@code eth_getLogs} reads exactly like a range containing
+     * no deposits. The cursor would then advance past blocks nobody has looked at.
+     *
+     * <p>{@link #callAllowingNull} is for the one method where a null answer is the
+     * protocol saying something real.
      */
     public JsonNode call(String method, Object... params) {
+        JsonNode result = callAllowingNull(method, params);
+        if (result.isNull()) {
+            throw new ChainUnavailable(method + " returned a null result");
+        }
+        return result;
+    }
+
+    /**
+     * Makes one call and returns its {@code result} even when that result is JSON
+     * {@code null}.
+     *
+     * <p>The methods that want this are the ones whose question has "not yet" or "not
+     * here" as a real answer: {@code eth_getBlockByNumber} for a height the node does not
+     * have, {@code eth_getTransactionReceipt} for a transaction still pending. In both
+     * cases the null is a fact the caller needs rather than a failure to report.
+     *
+     * <p>Everything else goes through {@link #call}. The split is deliberately opt-in, so
+     * a new call site has to say out loud that a null means something there, instead of
+     * inheriting a permissiveness nobody chose.
+     */
+    public JsonNode callAllowingNull(String method, Object... params) {
         Map<String, Object> body = Map.of(
                 "jsonrpc", "2.0",
                 "id", nextId.getAndIncrement(),

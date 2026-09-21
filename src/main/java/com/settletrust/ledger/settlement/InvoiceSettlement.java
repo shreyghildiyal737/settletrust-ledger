@@ -2,6 +2,7 @@ package com.settletrust.ledger.settlement;
 
 import com.settletrust.ledger.Account;
 import com.settletrust.ledger.AccountId;
+import com.settletrust.ledger.InternalAccounts;
 import com.settletrust.ledger.Money;
 import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
@@ -40,9 +41,10 @@ public class InvoiceSettlement {
      * their ids alone. An account id is the only thing a {@code chain:EURC} row carries to
      * say what it is for, so the prefix is part of the schema, not a formatting detail.
      */
-    public static final String ESCROW_ACCOUNT_PREFIX = "escrow:";
-    public static final String CHAIN_ACCOUNT_PREFIX = "chain:";
-    public static final String CHAIN_SHORTFALL_ACCOUNT_PREFIX = "chain-shortfall:";
+    public static final String ESCROW_ACCOUNT_PREFIX = InternalAccounts.ESCROW_PREFIX;
+    public static final String CHAIN_ACCOUNT_PREFIX = InternalAccounts.CHAIN_PREFIX;
+    public static final String CHAIN_SHORTFALL_ACCOUNT_PREFIX =
+            InternalAccounts.CHAIN_SHORTFALL_PREFIX;
 
     private final DSLContext dsl;
     private final PostgresLedger ledger;
@@ -154,11 +156,21 @@ public class InvoiceSettlement {
         AccountId escrow = escrowAccountFor(invoiceId);
         AccountId chain = chainAccountFor(amount.currency());
 
+        // Normally the escrow still holds the money and gives it back. If it does not, the
+        // payout already happened and the shortfall account absorbs it, which is the one
+        // account allowed to go negative for this: the platform is out of pocket until
+        // somebody sorts it out, and that is exactly what a negative house balance says.
         Money held = ledger.balanceOfWithin(config, escrow);
-        AccountId payer = held.isLessThan(amount)
-                ? chainShortfallAccountFor(amount.currency())
-                : escrow;
-        openIfMissing(config, payer, amount.currency(), Account.Kind.HOUSE);
+        boolean alreadyPaidOut = held.isLessThan(amount);
+        AccountId payer = alreadyPaidOut ? chainShortfallAccountFor(amount.currency()) : escrow;
+
+        // The kind has to follow the account, not the branch. An escrow account is a
+        // CUSTOMER account precisely so it cannot go negative, and asking for it as HOUSE
+        // here was harmless only because it always already exists by the time a deposit is
+        // being reversed. Naming the wrong kind for an account that is about to be created
+        // would have opened escrow that could be overdrawn.
+        Account.Kind kind = alreadyPaidOut ? Account.Kind.HOUSE : Account.Kind.CUSTOMER;
+        openIfMissing(config, payer, amount.currency(), kind);
 
         // Freeze the invoice so a person looks at it, unless it is already final. A
         // settled invoice stays settled: the seller was genuinely paid, and pretending
@@ -174,10 +186,31 @@ public class InvoiceSettlement {
         return new Settlement(transition, transfer);
     }
 
+    /**
+     * Opens one of the platform's own accounts, or checks that the one already there is
+     * the account it was going to open.
+     *
+     * <p>The check is not redundant with the reserved-prefix rule at the edge. That rule
+     * stops an outside caller claiming the name; this one catches the case where the name
+     * was taken by something that got past it, by a migration, by a fixture, or by a hand
+     * at a psql prompt. Adopting a stranger's account silently is how escrow ends up being
+     * held somewhere nobody chose, and the only clue would be a currency mismatch surfacing
+     * several steps later as a rejected transfer.
+     */
     private void openIfMissing(
             org.jooq.Configuration config, AccountId id, String currency, Account.Kind kind) {
-        if (!ledger.exists(config, id)) {
+        Optional<Account> existing = ledger.findWithin(config, id);
+        if (existing.isEmpty()) {
             ledger.openWithin(config, new Account(id, currency, kind));
+            return;
+        }
+
+        Account account = existing.get();
+        if (!account.currency().equals(currency) || account.kind() != kind) {
+            throw new IllegalStateException(
+                    "the platform account " + id + " already exists as " + account.currency()
+                            + "/" + account.kind() + ", but is needed as " + currency + "/"
+                            + kind);
         }
     }
 

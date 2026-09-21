@@ -762,20 +762,44 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | The two numbers worth alerting on are published, under the names a rule uses | `MetricsApiTest` |
 | Exposing metrics did not expose anything else | same |
 | The probes still answer, and still differ from each other | same |
+| A node's null result is refused rather than read as an empty answer | `JsonRpcTest` |
+| A null is still handed over where it is the answer, as for an absent block | same |
+| A node contradicting itself does not get a confirmed deposit reversed | `EscrowWatcherTest` |
+| Deposits buried past the finality depth are not asked about again | same |
+| A platform account namespace cannot be claimed from outside | `LedgerApiTest` |
+| The generic transfer endpoint will not pay out of a platform account | same |
 
 ```bash
 mvn test
 ```
 
 Java 21 and Maven. The Postgres tests start a container through Testcontainers, so Docker
-needs to be running. If Testcontainers cannot reach your Docker daemon, point the suite at
-any Postgres instead:
+needs to be running. If Testcontainers cannot reach your Docker daemon, stand one up by
+hand and point the suite at it instead:
 
 ```bash
-LEDGER_TEST_JDBC_URL=jdbc:postgresql://localhost:5432/ledger_test \
+docker run -d --name settletrust-postgres \
+  -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=settletrust_ledger_test -p 5433:5432 postgres:16-alpine
+
+LEDGER_TEST_JDBC_URL=jdbc:postgresql://localhost:5433/settletrust_ledger_test \
 LEDGER_TEST_DB_USER=postgres \
 LEDGER_TEST_DB_PASSWORD=postgres \
 mvn test
+```
+
+A database of its own rather than a spare one you happen to have running: the suite drops
+and recreates schemas, and the reconciliation tests want a freshly migrated one each,
+because a finding is a statement about a whole database rather than about one table in it.
+
+The chain tests need a node as well, and skip without one. With anvil up and the contracts
+built, they run too and nothing is skipped:
+
+```bash
+docker run -d --rm --name settletrust-anvil -p 8545:8545 \
+  ghcr.io/foundry-rs/foundry:latest "anvil --host 0.0.0.0"
+
+LEDGER_TEST_ETH_RPC=http://127.0.0.1:8545 mvn test   # with the two database variables too
 ```
 
 ## Status

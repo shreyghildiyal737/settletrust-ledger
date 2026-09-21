@@ -46,9 +46,10 @@ public final class FakeChain implements ChainSource, EscrowReserves {
     }
 
     @Override
-    public List<ChainDeposit> depositsFrom(long fromBlock) {
+    public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
         List<ChainDeposit> found = new ArrayList<>();
-        for (int number = (int) Math.max(0, fromBlock); number < blocks.size(); number++) {
+        long last = Math.min(toBlock, blocks.size() - 1L);
+        for (int number = (int) Math.max(0, fromBlock); number <= last; number++) {
             found.addAll(blocks.get(number).deposits());
         }
         return found;

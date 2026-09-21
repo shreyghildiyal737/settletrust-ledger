@@ -17,10 +17,14 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -317,5 +321,115 @@ class EscrowWatcherTest {
         return ledger.find(escrow()).isEmpty()
                 ? Money.zero("EURC")
                 : ledger.balanceOf(escrow());
+    }
+
+    /**
+     * A reversal moves money, so an ambiguous answer must not be enough to cause one.
+     *
+     * <p>A node that is re-syncing can report a head and still answer "no block" for a
+     * height below it. Read as a reorganisation, that unwinds confirmed deposits the chain
+     * never took back, and the entries it writes are as real as any others. The watcher
+     * refuses the pass instead and tries again on the next tick.
+     */
+    @Test
+    @DisplayName("a node contradicting itself does not get a deposit reversed")
+    void anIncoherentNodeDoesNotCauseAReversal() {
+        confirmTheDeposit();
+        assertEquals(AMOUNT, escrowBalance(), "the deposit should have been credited first");
+
+        ChainSource amnesiac = new ForgetfulNode(chain);
+
+        assertThrows(JsonRpc.ChainUnavailable.class, () -> watcher.poll(amnesiac),
+                "a node that cannot say what is at a height it claims to have is not evidence");
+
+        assertAll(
+                () -> assertEquals(AMOUNT, escrowBalance(),
+                        "the money must still be in escrow: nothing was taken back"),
+                () -> assertEquals(ObservationStatus.CONFIRMED,
+                        observations.find(txHash, 0).orElseThrow().status(),
+                        "the deposit must still be confirmed"));
+    }
+
+    /**
+     * The cost of a quiet pass must not grow with the number of deposits the platform has
+     * ever taken. Before this, the reorganisation sweep asked the node one question per
+     * confirmed deposit, for ever.
+     */
+    @Test
+    @DisplayName("deposits buried past the finality depth are not asked about again")
+    void settledHistoryIsNotRescanned() {
+        int finalityDepth = 4;
+        CountingNode counted = new CountingNode(chain);
+        EscrowWatcher shortMemory = new EscrowWatcher(
+                database.dsl(), observations,
+                new InvoiceSettlement(
+                        database.dsl(), ledger, invoices,
+                        new PostgresTransferService(database.dsl(), Clock.systemUTC())),
+                CONFIRMATIONS, finalityDepth);
+
+        ChainDeposit deposit = chain.mineDeposit(txHash, invoiceId, AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+        shortMemory.poll(counted);
+        assertEquals(AMOUNT, escrowBalance(), "the deposit should have been credited");
+
+        // Bury it well past the depth at which this service stops believing in reorgs.
+        chain.mineEmpty(finalityDepth + 5);
+        counted.asked.clear();
+        shortMemory.poll(counted);
+
+        assertTrue(counted.asked.stream().noneMatch(at -> at == deposit.blockNumber()),
+                () -> "settled history was re-checked: asked about " + counted.asked);
+    }
+
+    /** A node that reports a head and then denies having the blocks under it. */
+    private static final class ForgetfulNode implements ChainSource {
+
+        private final ChainSource real;
+
+        private ForgetfulNode(ChainSource real) {
+            this.real = real;
+        }
+
+        @Override
+        public long headBlockNumber() {
+            return real.headBlockNumber();
+        }
+
+        @Override
+        public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+            return real.depositsFrom(fromBlock, toBlock);
+        }
+
+        @Override
+        public Optional<String> blockHashAt(long blockNumber) {
+            return Optional.empty();
+        }
+    }
+
+    /** Records which heights the watcher asked about, so the sweep's cost can be asserted. */
+    private static final class CountingNode implements ChainSource {
+
+        private final ChainSource real;
+        private final List<Long> asked = new ArrayList<>();
+
+        private CountingNode(ChainSource real) {
+            this.real = real;
+        }
+
+        @Override
+        public long headBlockNumber() {
+            return real.headBlockNumber();
+        }
+
+        @Override
+        public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+            return real.depositsFrom(fromBlock, toBlock);
+        }
+
+        @Override
+        public Optional<String> blockHashAt(long blockNumber) {
+            asked.add(blockNumber);
+            return real.blockHashAt(blockNumber);
+        }
     }
 }

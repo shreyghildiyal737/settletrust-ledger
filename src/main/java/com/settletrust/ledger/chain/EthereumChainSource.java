@@ -112,11 +112,12 @@ public class EthereumChainSource implements ChainSource {
      * <p>Filtered by address and topic at the node, so a busy chain does not become this
      * process's problem, and never below the block the contract was deployed in.
      *
-     * <p>The head is read once and the scan ends there, rather than asking for
-     * {@code latest} on each page. Paging to a moving target would return a set of logs
-     * that belongs to no single height, and the report of how far the chain was read would
-     * name a block the earlier pages had not covered. A deposit that lands during the scan
-     * is simply picked up next pass, and would not have been deep enough to act on anyway.
+     * <p>The scan ends at the head the caller passed in, rather than asking for
+     * {@code latest} on each page or reading a head of its own. Paging to a moving target
+     * would return a set of logs that belongs to no single height, and the report of how
+     * far the chain was read would name a block the earlier pages had not covered. A
+     * deposit that lands during the scan is simply picked up next pass, and would not have
+     * been deep enough to act on anyway.
      *
      * <p>Paged because a hosted provider caps the span of a single {@code eth_getLogs} and
      * refuses anything wider outright. In the steady state the cursor is a few blocks
@@ -125,13 +126,12 @@ public class EthereumChainSource implements ChainSource {
      * unpaged version would fail.
      */
     @Override
-    public List<ChainDeposit> depositsFrom(long fromBlock) {
-        long head = headBlockNumber();
+    public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
         long from = Math.max(fromBlock, deployedAtBlock);
 
         List<ChainDeposit> deposits = new ArrayList<>();
-        while (from <= head) {
-            long to = Math.min(head, from + maxBlockSpan - 1);
+        while (from <= toBlock) {
+            long to = Math.min(toBlock, from + maxBlockSpan - 1);
             collectDeposits(from, to, deposits);
             from = to + 1;
         }
@@ -162,7 +162,10 @@ public class EthereumChainSource implements ChainSource {
         }
         // false: the transaction bodies are never read here and a full block on a busy
         // chain is megabytes of them.
-        JsonNode block = rpc.call("eth_getBlockByNumber", Hex.quantity(blockNumber), false);
+        // The one place a null result is an answer rather than a silence: a node asked
+        // for a height it does not have says so with null, by specification.
+        JsonNode block = rpc.callAllowingNull(
+                "eth_getBlockByNumber", Hex.quantity(blockNumber), false);
         if (block.isNull()) {
             return Optional.empty();
         }

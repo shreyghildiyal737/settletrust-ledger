@@ -118,8 +118,21 @@ public class PostgresChainObservations {
     }
 
     public List<ChainObservation> withStatus(ObservationStatus status) {
+        return withStatusAtOrAbove(status, Long.MIN_VALUE);
+    }
+
+    /**
+     * The observations in a status, from {@code minBlock} upwards.
+     *
+     * <p>The bound is what keeps the watcher's cost flat. Confirmed deposits accumulate for
+     * the life of the platform and the reorganisation sweep asks the node one question per
+     * observation, so an unbounded version of this query turns a quiet pass into one
+     * request per deposit ever taken, every fifteen seconds.
+     */
+    public List<ChainObservation> withStatusAtOrAbove(ObservationStatus status, long minBlock) {
         return dsl.selectFrom(CHAIN_OBSERVATION)
                 .where(CHAIN_OBSERVATION.STATUS.eq(status.name()))
+                .and(CHAIN_OBSERVATION.BLOCK_NUMBER.ge(minBlock))
                 .orderBy(CHAIN_OBSERVATION.BLOCK_NUMBER.asc(), CHAIN_OBSERVATION.LOG_INDEX.asc())
                 .fetch()
                 .map(PostgresChainObservations::toObservation);
