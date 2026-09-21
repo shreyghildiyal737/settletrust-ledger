@@ -164,10 +164,14 @@ public class PostgresReconciliationRuns {
      * is computed rather than stored.
      */
     public Optional<OpenFindings> openFindings() {
+        // By commit order rather than by ran_at. Two replicas contend for the lease, so the
+        // run that wrote a row is not always the same machine, and a clock a few seconds
+        // behind would anchor this on an older full run and keep reporting findings a later
+        // one had closed. The id is no tiebreak either: these are random uuids.
         Record anchor = dsl.select(RECONCILIATION_RUN.ID, RECONCILIATION_RUN.RAN_AT)
                 .from(RECONCILIATION_RUN)
                 .where(RECONCILIATION_RUN.MODE.eq(RunMode.FULL.name()))
-                .orderBy(RECONCILIATION_RUN.RAN_AT.desc(), RECONCILIATION_RUN.ID.desc())
+                .orderBy(RECONCILIATION_RUN.XID.desc(), RECONCILIATION_RUN.ID.desc())
                 .limit(1)
                 .fetchOne();
 

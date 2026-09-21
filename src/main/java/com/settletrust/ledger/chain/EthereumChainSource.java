@@ -2,6 +2,8 @@ package com.settletrust.ledger.chain;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.settletrust.ledger.Money;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -21,6 +23,8 @@ import java.util.Optional;
  * judgement about whether to believe it yet belongs to {@link EscrowWatcher}.
  */
 public class EthereumChainSource implements ChainSource {
+
+    private static final Logger LOG = LoggerFactory.getLogger(EthereumChainSource.class);
 
     /**
      * {@code keccak256("EscrowDeposited(bytes32,address,address,uint256)")}, the first
@@ -126,19 +130,21 @@ public class EthereumChainSource implements ChainSource {
      * unpaged version would fail.
      */
     @Override
-    public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+    public Scan depositsFrom(long fromBlock, long toBlock) {
         long from = Math.max(fromBlock, deployedAtBlock);
 
         List<ChainDeposit> deposits = new ArrayList<>();
+        List<String> undecodable = new ArrayList<>();
         while (from <= toBlock) {
             long to = Math.min(toBlock, from + maxBlockSpan - 1);
-            collectDeposits(from, to, deposits);
+            collectDeposits(from, to, deposits, undecodable);
             from = to + 1;
         }
-        return deposits;
+        return new Scan(deposits, undecodable);
     }
 
-    private void collectDeposits(long fromBlock, long toBlock, List<ChainDeposit> into) {
+    private void collectDeposits(
+            long fromBlock, long toBlock, List<ChainDeposit> into, List<String> undecodable) {
         JsonNode logs = rpc.call("eth_getLogs", Map.of(
                 "fromBlock", Hex.quantity(fromBlock),
                 "toBlock", Hex.quantity(toBlock),
@@ -151,7 +157,19 @@ public class EthereumChainSource implements ChainSource {
             if (log.path("removed").asBoolean(false) || log.path("blockNumber").isNull()) {
                 continue;
             }
-            into.add(toDeposit(log));
+            // Per log, not per scan. An invoice id that is not UTF-8, or an amount too
+            // large for the ledger's bigint, is a fault in this one event: the contract
+            // accepts both from anyone. Letting it escape would end the scan, and the log
+            // does not go away, so the next pass would end in the same place.
+            try {
+                into.add(toDeposit(log));
+            } catch (RuntimeException unreadable) {
+                String at = log.path("transactionHash").asText("?")
+                        + ":" + log.path("logIndex").asText("?");
+                LOG.warn("Ignoring deposit log {}, which cannot be read: {}",
+                        at, unreadable.getMessage());
+                undecodable.add(at);
+            }
         }
     }
 

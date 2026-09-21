@@ -34,6 +34,8 @@ public final class FakeChain implements ChainSource, EscrowReserves {
      */
     private final Map<String, Long> offChainBook = new HashMap<>();
 
+    private final List<String> unreadable = new ArrayList<>();
+
     private int minted;
 
     public FakeChain() {
@@ -46,13 +48,22 @@ public final class FakeChain implements ChainSource, EscrowReserves {
     }
 
     @Override
-    public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+    public Scan depositsFrom(long fromBlock, long toBlock) {
         List<ChainDeposit> found = new ArrayList<>();
         long last = Math.min(toBlock, blocks.size() - 1L);
         for (int number = (int) Math.max(0, fromBlock); number <= last; number++) {
             found.addAll(blocks.get(number).deposits());
         }
-        return found;
+        return new Scan(found, List.copyOf(unreadable));
+    }
+
+    /**
+     * Logs the watcher will be told it could not read, as a real chain would carry after
+     * somebody emitted an event with an invoice id that is not UTF-8.
+     */
+    public void mineUnreadableDeposit(String at) {
+        unreadable.add(at);
+        mineEmpty(1);
     }
 
     @Override

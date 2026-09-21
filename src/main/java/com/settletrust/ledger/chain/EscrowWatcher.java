@@ -1,6 +1,7 @@
 package com.settletrust.ledger.chain;
 
 import com.settletrust.ledger.invoice.InvoiceTransitionRejected;
+import com.settletrust.ledger.settlement.ChainDepositMismatch;
 import com.settletrust.ledger.settlement.InvoiceSettlement;
 import org.jooq.DSLContext;
 import org.slf4j.Logger;
@@ -86,7 +87,11 @@ public class EscrowWatcher {
             int abandoned,
             int reversed,
             /** Deposits naming an invoice this platform never issued. */
-            int unattributed) {
+            int unattributed,
+            /** Logs the chain source could not read at all. */
+            int undecodable,
+            /** Deposits naming a real invoice they cannot be applied to. */
+            int mismatched) {
     }
 
     /**
@@ -119,7 +124,15 @@ public class EscrowWatcher {
         int recorded = 0;
         int reanchored = 0;
         int unattributed = 0;
-        for (ChainDeposit deposit : chain.depositsFrom(from, head)) {
+        ChainSource.Scan scan = chain.depositsFrom(from, head);
+        if (!scan.undecodable().isEmpty()) {
+            // Not an error to stop on: these are events anybody can emit, and they stay in
+            // their block for ever. Loud, counted, and stepped over.
+            log.warn("{} deposit log(s) could not be read and were skipped: {}",
+                    scan.undecodable().size(), scan.undecodable());
+        }
+
+        for (ChainDeposit deposit : scan.deposits()) {
             switch (observations.recordIfNew(deposit)) {
                 case RECORDED -> recorded++;
                 case UNKNOWN_INVOICE -> {
@@ -154,7 +167,9 @@ public class EscrowWatcher {
                 promotions.deferred(),
                 promotions.abandoned(),
                 reversed,
-                unattributed);
+                unattributed,
+                scan.undecodable().size(),
+                promotions.mismatched());
     }
 
     private int reverseWhatTheChainTookBack(ChainSource chain, long head) {
@@ -187,6 +202,7 @@ public class EscrowWatcher {
         int confirmed = 0;
         int deferred = 0;
         int abandoned = 0;
+        int mismatched = 0;
 
         for (ChainObservation observation : observations.withStatus(ObservationStatus.PENDING)) {
             // Past the finality depth the chain is not asked again, for the same reason the
@@ -215,6 +231,16 @@ public class EscrowWatcher {
                     observations.markWithin(config, observation, ObservationStatus.CONFIRMED);
                 });
                 confirmed++;
+            } catch (ChainDepositMismatch wrong) {
+                // Nothing retrying can fix: what arrived does not fit the invoice it names.
+                // Marked terminal so it is not reconsidered for ever, and left uncredited so
+                // the money stays visible to the reserves check as a balance the ledger
+                // cannot account for.
+                log.warn("Deposit {}:{} names invoice {} and cannot be applied to it: {}",
+                        observation.txHash(), observation.logIndex(),
+                        observation.invoiceId(), wrong.getMessage());
+                observations.mark(observation, ObservationStatus.MISMATCHED);
+                mismatched++;
             } catch (InvoiceTransitionRejected notReady) {
                 // The money is real but the invoice is not ready to be funded, so it is
                 // left pending and tried again next pass. Money on chain does not oblige
@@ -225,7 +251,7 @@ public class EscrowWatcher {
                 deferred++;
             }
         }
-        return new Promotions(confirmed, deferred, abandoned);
+        return new Promotions(confirmed, deferred, abandoned, mismatched);
     }
 
     /**
@@ -254,6 +280,6 @@ public class EscrowWatcher {
         return canonical.equals(observation.blockHash());
     }
 
-    private record Promotions(int confirmed, int deferred, int abandoned) {
+    private record Promotions(int confirmed, int deferred, int abandoned, int mismatched) {
     }
 }

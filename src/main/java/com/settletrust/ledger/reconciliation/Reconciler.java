@@ -18,6 +18,7 @@ import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -31,6 +32,7 @@ import static com.settletrust.ledger.jooq.Tables.ACCOUNT;
 import static com.settletrust.ledger.jooq.Tables.CHAIN_CURSOR;
 import static com.settletrust.ledger.jooq.Tables.CHAIN_OBSERVATION;
 import static com.settletrust.ledger.jooq.Tables.ENTRY;
+import static com.settletrust.ledger.jooq.Tables.INVOICE;
 import static com.settletrust.ledger.jooq.Tables.TRANSFER;
 
 /**
@@ -219,11 +221,19 @@ public class Reconciler {
             found.addAll(creditsWithNoConfirmedDepositBehindThem(snapshot, range));
             found.addAll(chainAccountsAgainstWhatTheChainSent(snapshot));
             found.addAll(overdrawnCustomerAccounts(snapshot, range));
+            found.addAll(escrowsThatDoNotMatchTheirInvoice(snapshot, range));
 
             // Last, and outside the snapshot of necessity, because the chain has no
             // snapshot to join. See reservesAgainstTheChain for why the order matters.
             Optional<Long> readTo = watcherHasReadTo(snapshot);
             found.addAll(reservesAgainstTheChain(snapshot, readTo));
+
+            // Ordered rather than left in the order the checks happen to run, and ordered
+            // by the same keys the stored findings are read back with. A report is evidence
+            // about a moment, so the copy handed to the caller and the copy read out of the
+            // database afterwards should be the same document, not two orderings of it.
+            found.sort(Comparator.comparing((Discrepancy d) -> d.kind().name())
+                    .thenComparing(Discrepancy::subject));
 
             ReconciliationReport report = new ReconciliationReport(
                     UUID.randomUUID(),
@@ -528,6 +538,20 @@ public class Reconciler {
                     subject,
                     "credited to " + creditedTo + " rather than " + expectedEscrow));
         }
+
+        // Both ends, not just the destination. A credit under a chain deposit's key that
+        // came from anywhere but the chain account moved somebody else's money into this
+        // escrow, and the amount and destination would both still look right. The aggregate
+        // chain-account check is the other way of catching it, and it cannot see a currency
+        // whose chain account was never opened.
+        String expectedSource = InvoiceSettlement.chainAccountFor(reported.currency()).value();
+        String creditedFrom = row.get(credit.FROM_ACCOUNT);
+        if (!expectedSource.equals(creditedFrom)) {
+            found.add(Discrepancy.of(
+                    DiscrepancyKind.CREDIT_MISDIRECTED,
+                    subject,
+                    "credited from " + creditedFrom + " rather than " + expectedSource));
+        }
         return found;
     }
 
@@ -547,6 +571,19 @@ public class Reconciler {
         }
 
         Money undone = Money.of(row.get(reversal.AMOUNT_MINOR), row.get(reversal.CURRENCY));
+
+        // A reversal has to put the money back where it came from. Checking only the amount
+        // would accept one that took the right sum out of an unrelated account, which
+        // leaves that account short and this deposit looking correctly undone.
+        String expectedTarget = InvoiceSettlement.chainAccountFor(reported.currency()).value();
+        String returnedTo = row.get(reversal.TO_ACCOUNT);
+        if (!expectedTarget.equals(returnedTo)) {
+            return List.of(Discrepancy.of(
+                    DiscrepancyKind.CREDIT_MISDIRECTED,
+                    subject,
+                    "reversed into " + returnedTo + " rather than " + expectedTarget));
+        }
+
         if (undone.equals(reported)) {
             return List.of();
         }
@@ -633,32 +670,41 @@ public class Reconciler {
                         row.get(CHAIN_OBSERVATION.CURRENCY), row.get(deposited).longValueExact()));
 
         Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
-
-        return snapshot.select(ACCOUNT.ID, ACCOUNT.CURRENCY, balance)
+        Map<String, Long> ledgerByCurrency = new HashMap<>();
+        snapshot.select(ACCOUNT.CURRENCY, balance)
                 .from(ACCOUNT)
                 .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
                 .where(ACCOUNT.ID.startsWith(InvoiceSettlement.CHAIN_ACCOUNT_PREFIX))
-                .groupBy(ACCOUNT.ID, ACCOUNT.CURRENCY)
+                .groupBy(ACCOUNT.CURRENCY)
                 .fetch()
-                .stream()
-                .map(row -> {
-                    String currency = row.get(ACCOUNT.CURRENCY);
-                    Money held = Money.of(row.get(balance).longValueExact(), currency);
-                    Money owed = Money.of(
-                            -confirmedByCurrency.getOrDefault(currency, 0L), currency);
-                    return held.equals(owed)
-                            ? null
-                            : Discrepancy.mismatch(
-                                    DiscrepancyKind.CHAIN_ACCOUNT_DISAGREES,
-                                    row.get(ACCOUNT.ID),
-                                    "the chain confirmed " + owed.negated()
-                                            + " into escrow and the ledger moved "
-                                            + held.negated(),
-                                    owed,
-                                    held);
-                })
-                .filter(Objects::nonNull)
-                .toList();
+                .forEach(row -> ledgerByCurrency.put(
+                        row.get(ACCOUNT.CURRENCY), row.get(balance).longValueExact()));
+
+        // Every currency either side knows about, rather than only the ones with a chain
+        // account. Driving this off the account rows made it blind in exactly the case it
+        // exists for: a currency the chain confirmed into escrow with no chain:<ccy> account
+        // was never iterated, so the sum was computed and then never compared to anything.
+        // The per-deposit checks would not catch that either, since the money reached the
+        // right escrow for the right amount. It just came from somewhere it should not have.
+        Set<String> currencies = new TreeSet<>(confirmedByCurrency.keySet());
+        currencies.addAll(ledgerByCurrency.keySet());
+
+        List<Discrepancy> found = new ArrayList<>();
+        for (String currency : currencies) {
+            Money held = Money.of(ledgerByCurrency.getOrDefault(currency, 0L), currency);
+            Money owed = Money.of(-confirmedByCurrency.getOrDefault(currency, 0L), currency);
+            if (held.equals(owed)) {
+                continue;
+            }
+            found.add(Discrepancy.mismatch(
+                    DiscrepancyKind.CHAIN_ACCOUNT_DISAGREES,
+                    InvoiceSettlement.chainAccountFor(currency).value(),
+                    "the chain confirmed " + owed.negated()
+                            + " into escrow and the ledger moved " + held.negated(),
+                    owed,
+                    held));
+        }
+        return found;
     }
 
     /**
@@ -699,6 +745,57 @@ public class Reconciler {
                             Money.zero(currency),
                             held);
                 });
+    }
+
+    /**
+     * Escrow accounts against the invoices they are named for.
+     *
+     * <p>The only check here that compares the ledger against what was actually agreed
+     * rather than against the chain or against itself, and the only one that would notice
+     * a deposit which paid a real invoice the wrong amount. Escrow rests at nothing or at
+     * the invoice's amount; between the two is money that arrived and settles nothing.
+     *
+     * <p>Windowed the same way as the overdraft check, and for the same reason: the window
+     * picks the accounts, and each one's balance is then summed over every entry it has.
+     * An escrow nothing was posted to cannot have changed.
+     */
+    private List<Discrepancy> escrowsThatDoNotMatchTheirInvoice(
+            DSLContext snapshot, CheckedRange range) {
+
+        Field<BigDecimal> balance = DSL.coalesce(DSL.sum(ENTRY.AMOUNT_MINOR), BigDecimal.ZERO);
+        com.settletrust.ledger.jooq.tables.Entry touched = ENTRY.as("touched");
+        int prefix = InvoiceSettlement.ESCROW_ACCOUNT_PREFIX.length();
+
+        return snapshot.select(
+                        ACCOUNT.ID, ACCOUNT.CURRENCY,
+                        INVOICE.AMOUNT_MINOR, INVOICE.CURRENCY.as("invoice_currency"),
+                        balance)
+                .from(ACCOUNT)
+                .join(INVOICE).on(INVOICE.ID.eq(DSL.substring(ACCOUNT.ID, prefix + 1)))
+                .leftJoin(ENTRY).on(ENTRY.ACCOUNT_ID.eq(ACCOUNT.ID))
+                .where(ACCOUNT.ID.startsWith(InvoiceSettlement.ESCROW_ACCOUNT_PREFIX))
+                .and(ACCOUNT.ID.in(DSL.select(touched.ACCOUNT_ID)
+                        .from(touched)
+                        .where(range.covering(touched.XID))))
+                .groupBy(ACCOUNT.ID, ACCOUNT.CURRENCY, INVOICE.AMOUNT_MINOR, INVOICE.CURRENCY)
+                .fetch()
+                .stream()
+                .map(row -> {
+                    String currency = row.get(ACCOUNT.CURRENCY);
+                    Money held = Money.of(row.get(balance).longValueExact(), currency);
+                    Money owed = Money.of(row.get(INVOICE.AMOUNT_MINOR), currency);
+                    if (held.minorUnits() == 0L || held.equals(owed)) {
+                        return null;
+                    }
+                    return Discrepancy.mismatch(
+                            DiscrepancyKind.ESCROW_DOES_NOT_MATCH_INVOICE,
+                            row.get(ACCOUNT.ID),
+                            "the escrow holds " + held + " against an invoice for " + owed,
+                            owed,
+                            held);
+                })
+                .filter(Objects::nonNull)
+                .toList();
     }
 
     /**
@@ -777,6 +874,12 @@ public class Reconciler {
         snapshot.select(CHAIN_OBSERVATION.CURRENCY, waiting)
                 .from(CHAIN_OBSERVATION)
                 .where(CHAIN_OBSERVATION.STATUS.eq(ObservationStatus.PENDING.name()))
+                // Bounded by the same block the contract balance was read at. Without this
+                // the surplus is measured at the cursor while the pending amounts offsetting
+                // it are not, so a pending row above the cursor cancels out a surplus below
+                // it. Reachable after a crash: a pass commits its observations before it
+                // writes the cursor, so dying in between leaves exactly that.
+                .and(CHAIN_OBSERVATION.BLOCK_NUMBER.le(asOfBlock))
                 .groupBy(CHAIN_OBSERVATION.CURRENCY)
                 .fetch()
                 .forEach(row -> awaitingConfirmation.put(

@@ -176,16 +176,27 @@ class ReconcilerTest {
 
         ReconciliationReport report = reconciler.run().orElseThrow();
 
+        // Two findings, from opposite ends of the same fact. The per-deposit check says this
+        // deposit moved no money; the aggregate check says the chain account does not reflect
+        // what the chain sent. The aggregate one used to be silent here, because it iterated
+        // the chain accounts that existed and nothing had ever opened chain:EURC. A currency
+        // the chain confirmed with no account behind it was exactly the case it could not see.
+        Discrepancy uncredited = report.discrepancies().stream()
+                .filter(d -> d.kind() == DiscrepancyKind.CONFIRMED_DEPOSIT_NOT_CREDITED)
+                .findFirst()
+                .orElseThrow(() -> new AssertionError(
+                        "no uncredited-deposit finding in " + report.discrepancies()));
+
         assertAll(
-                () -> assertEquals(1, report.discrepancies().size(),
-                        () -> "exactly one thing is wrong: " + report.discrepancies()),
-                () -> assertEquals(DiscrepancyKind.CONFIRMED_DEPOSIT_NOT_CREDITED,
-                        report.discrepancies().getFirst().kind()),
-                () -> assertEquals(txHash + ":0", report.discrepancies().getFirst().subject()),
-                () -> assertEquals(AMOUNT,
-                        report.discrepancies().getFirst().expectedAmount().orElseThrow()),
-                () -> assertEquals(Money.zero("EURC"),
-                        report.discrepancies().getFirst().foundAmount().orElseThrow()));
+                () -> assertEquals(2, report.discrepancies().size(),
+                        () -> "both ends should notice: " + report.discrepancies()),
+                () -> assertTrue(report.discrepancies().stream().anyMatch(
+                                d -> d.kind() == DiscrepancyKind.CHAIN_ACCOUNT_DISAGREES),
+                        () -> "the aggregate check should see EURC even with no chain account: "
+                                + report.discrepancies()),
+                () -> assertEquals(txHash + ":0", uncredited.subject()),
+                () -> assertEquals(AMOUNT, uncredited.expectedAmount().orElseThrow()),
+                () -> assertEquals(Money.zero("EURC"), uncredited.foundAmount().orElseThrow()));
     }
 
     @Test

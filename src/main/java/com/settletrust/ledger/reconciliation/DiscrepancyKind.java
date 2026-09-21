@@ -82,5 +82,27 @@ public enum DiscrepancyKind {
      * changed after it was checked, which the append-only triggers are supposed to make
      * impossible and this is how anyone would find out they had not.
      */
-    CHECKPOINT_DRIFT
+    CHECKPOINT_DRIFT,
+
+    /**
+     * An invoice's escrow holds an amount that is neither nothing nor the invoice's own.
+     *
+     * <p>Escrow has exactly two resting states. Empty, because it has not been funded yet
+     * or because it has already been released. Or holding the invoice amount exactly,
+     * because that is what being funded means. Anything between the two is money that
+     * arrived against this invoice and does not settle it.
+     *
+     * <p>The chain rail is how it happens. The contract takes an amount and a bytes32 from
+     * anyone and compares neither against an invoice it has never heard of, so a deposit
+     * can be short, and the contract allows one deposit per invoice id, so it cannot then
+     * be topped up. The credit is kept, because the money is real and the platform is
+     * holding it, and the invoice stays unfunded, because a seller reads escrow_funded as
+     * a promise that the whole amount is there. This finding is what puts the resulting
+     * stalemate in front of a person.
+     *
+     * <p>Every other check here compares the ledger against the chain or against itself.
+     * This one is the only one that compares the ledger against what the business actually
+     * agreed, which is why nothing caught it before it existed.
+     */
+    ESCROW_DOES_NOT_MATCH_INVOICE
 }

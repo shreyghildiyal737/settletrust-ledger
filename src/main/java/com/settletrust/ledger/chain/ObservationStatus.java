@@ -13,5 +13,14 @@ public enum ObservationStatus {
     REVERSED,
 
     /** Seen while pending, then dropped by the chain before it was ever credited. */
-    ABANDONED
+    ABANDONED,
+
+    /**
+     * Names an invoice that exists, and cannot be applied to it: the wrong currency.
+     *
+     * <p>Terminal, unlike PENDING. Waiting longer cannot fix what arrived, and a deposit
+     * left pending would be reconsidered on every pass for ever. Nothing is credited, so
+     * the money stays visible as a contract balance the ledger cannot explain.
+     */
+    MISMATCHED
 }

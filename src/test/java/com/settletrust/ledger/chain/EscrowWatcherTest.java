@@ -381,6 +381,96 @@ class EscrowWatcherTest {
                 () -> "settled history was re-checked: asked about " + counted.asked);
     }
 
+    /**
+     * The contract takes an amount from anyone and checks it against nothing, and it allows
+     * one deposit per invoice id, so a short one cannot be topped up afterwards.
+     *
+     * <p>The money is credited, because it arrived and the platform is holding it and a
+     * ledger that left it out would understate the escrow. The invoice is not funded,
+     * because a seller reads escrow_funded as a promise that the whole amount is there and
+     * ships on the strength of it.
+     */
+    @Test
+    @DisplayName("a short deposit is credited and does not fund the invoice")
+    void aShortDepositDoesNotFundTheInvoice() {
+        Money short_ = Money.of(1L, "EURC");
+        chain.mineDeposit(txHash, invoiceId, short_);
+        chain.mineEmpty(CONFIRMATIONS);
+
+        EscrowWatcher.PollResult result = watcher.poll(chain);
+
+        assertAll(
+                () -> assertEquals(1, result.confirmed(), "the deposit should still be credited"),
+                () -> assertEquals(short_, escrowBalance(),
+                        "the money arrived and belongs on the books"),
+                () -> assertEquals(InvoiceStatus.ESCROW_PENDING,
+                        invoices.find(invoiceId).orElseThrow().status(),
+                        "an invoice holding 1 of 250000 is not funded"),
+                () -> assertEquals(0L, ledger.sumOfAllEntries("EURC"),
+                        "the books still balance"));
+    }
+
+    /** And asking again gives the same answer rather than failing on the missing transition. */
+    @Test
+    @DisplayName("polling again after a short deposit changes nothing")
+    void aShortDepositIsIdempotent() {
+        chain.mineDeposit(txHash, invoiceId, Money.of(1L, "EURC"));
+        chain.mineEmpty(CONFIRMATIONS);
+        watcher.poll(chain);
+
+        watcher.poll(chain);
+
+        assertAll(
+                () -> assertEquals(Money.of(1L, "EURC"), escrowBalance(),
+                        "a second pass must not credit it twice"),
+                () -> assertEquals(InvoiceStatus.ESCROW_PENDING,
+                        invoices.find(invoiceId).orElseThrow().status()));
+    }
+
+    /**
+     * Nothing retrying can fix a deposit in the wrong currency, so it is terminal rather
+     * than pending. Nothing is credited, which leaves the money where the reserves check
+     * can see it: a contract balance the ledger cannot explain.
+     */
+    @Test
+    @DisplayName("a deposit in the wrong currency is refused and not retried for ever")
+    void aWrongCurrencyDepositIsTerminal() {
+        chain.mineDeposit(txHash, invoiceId, Money.of(250_000L, "USDC"));
+        chain.mineEmpty(CONFIRMATIONS);
+
+        EscrowWatcher.PollResult result = watcher.poll(chain);
+
+        assertAll(
+                () -> assertEquals(1, result.mismatched(), "it should be counted, not hidden"),
+                () -> assertEquals(0, result.confirmed(), "nothing may be credited"),
+                () -> assertEquals(ObservationStatus.MISMATCHED,
+                        observations.find(txHash, 0).orElseThrow().status(),
+                        "terminal, so it is not reconsidered on every pass for ever"),
+                () -> assertEquals(InvoiceStatus.ESCROW_PENDING,
+                        invoices.find(invoiceId).orElseThrow().status()));
+    }
+
+    /**
+     * One event anybody can emit must not be able to stop the rail for everybody. The log
+     * stays in its block, so a decode that threw would end this pass and every pass after.
+     */
+    @Test
+    @DisplayName("a log that cannot be read is stepped over, not thrown")
+    void anUnreadableLogDoesNotStopTheRail() {
+        chain.mineUnreadableDeposit("0xgarbage:0");
+        chain.mineDeposit(txHash, invoiceId, AMOUNT);
+        chain.mineEmpty(CONFIRMATIONS);
+
+        EscrowWatcher.PollResult result = watcher.poll(chain);
+
+        assertAll(
+                () -> assertEquals(1, result.undecodable(), "it should be counted, not dropped"),
+                () -> assertEquals(AMOUNT, escrowBalance(),
+                        "the real deposit behind it must still be credited"),
+                () -> assertEquals(InvoiceStatus.ESCROW_FUNDED,
+                        invoices.find(invoiceId).orElseThrow().status()));
+    }
+
     /** A node that reports a head and then denies having the blocks under it. */
     private static final class ForgetfulNode implements ChainSource {
 
@@ -396,7 +486,7 @@ class EscrowWatcherTest {
         }
 
         @Override
-        public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+        public Scan depositsFrom(long fromBlock, long toBlock) {
             return real.depositsFrom(fromBlock, toBlock);
         }
 
@@ -422,7 +512,7 @@ class EscrowWatcherTest {
         }
 
         @Override
-        public List<ChainDeposit> depositsFrom(long fromBlock, long toBlock) {
+        public Scan depositsFrom(long fromBlock, long toBlock) {
             return real.depositsFrom(fromBlock, toBlock);
         }
 

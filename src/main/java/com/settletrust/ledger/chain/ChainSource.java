@@ -25,7 +25,35 @@ public interface ChainSource {
      * one head while the scan was bounded by another, and any block between the two would
      * be marked read without ever being looked at.
      */
-    List<ChainDeposit> depositsFrom(long fromBlock, long toBlock);
+    Scan depositsFrom(long fromBlock, long toBlock);
+
+    /**
+     * What one scan of a block range found.
+     *
+     * <p>The logs that could not be read are carried separately rather than thrown,
+     * because a single one of them is otherwise enough to stop the rail for everybody.
+     * The contract takes a bytes32 from anyone, so anyone can emit an event whose invoice
+     * id is not UTF-8, and a decode that throws mid-scan takes the whole pass with it,
+     * on that pass and on every pass afterwards, since the log stays in its block for
+     * ever.
+     *
+     * <p>They are counted rather than dropped for the usual reason: silence about
+     * something nobody looked at is indistinguishable from silence about something that
+     * was fine.
+     *
+     * @param undecodable the {@code txHash:logIndex} of each log that could not be read
+     */
+    record Scan(List<ChainDeposit> deposits, List<String> undecodable) {
+
+        public Scan {
+            deposits = List.copyOf(deposits);
+            undecodable = List.copyOf(undecodable);
+        }
+
+        static Scan of(List<ChainDeposit> deposits) {
+            return new Scan(deposits, List.of());
+        }
+    }
 
     /**
      * The hash of the canonical block at this height, or empty if the chain is not that

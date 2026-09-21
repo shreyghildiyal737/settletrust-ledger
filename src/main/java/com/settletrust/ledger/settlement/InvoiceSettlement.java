@@ -114,9 +114,19 @@ public class InvoiceSettlement {
 
         String key = SettlementKeys.chainDeposit(txHash, logIndex);
         Optional<Settlement> alreadyDone =
-                alreadyDone(config, invoiceId, key, InvoiceStatus.ESCROW_FUNDED);
+                alreadyCredited(config, invoiceId, key, InvoiceStatus.ESCROW_FUNDED);
         if (alreadyDone.isPresent()) {
             return alreadyDone.get();
+        }
+
+        // What the contract accepted is not what this invoice is owed. The contract takes
+        // an amount and a bytes32 from anyone and checks neither against an invoice it has
+        // never heard of, so the comparison has to happen here or nowhere.
+        Money owed = requireInvoice(config, invoiceId).invoice().amount();
+        if (!amount.currency().equals(owed.currency())) {
+            throw new ChainDepositMismatch(
+                    "the deposit is " + amount + " and invoice " + invoiceId + " is in "
+                            + owed.currency() + ", which its escrow cannot hold");
         }
 
         AccountId escrow = escrowAccountFor(invoiceId);
@@ -124,8 +134,21 @@ public class InvoiceSettlement {
         openIfMissing(config, escrow, amount.currency(), Account.Kind.CUSTOMER);
         openIfMissing(config, chain, amount.currency(), Account.Kind.HOUSE);
 
-        InvoiceTransition transition = invoices.transitionWithin(
-                config, invoiceId, InvoiceStatus.ESCROW_FUNDED, null, "on-chain deposit " + txHash);
+        // The money is credited either way: it arrived, the platform controls it, and a
+        // ledger that omitted it would be understating what is being held. What a short or
+        // over-sized deposit does not do is fund the invoice, because escrow_funded is a
+        // claim that the whole amount is there and the seller ships on the strength of it.
+        //
+        // The contract allows one deposit per invoice id, so this cannot be topped up and
+        // somebody has to decide whether to refund it or invoice the difference. Leaving
+        // the invoice in escrow_pending is what puts that decision in front of them; the
+        // reconciler raises it as ESCROW_UNDERFUNDED rather than waiting to be asked.
+        boolean coversTheInvoice = amount.equals(owed);
+        InvoiceTransition transition = coversTheInvoice
+                ? invoices.transitionWithin(
+                        config, invoiceId, InvoiceStatus.ESCROW_FUNDED,
+                        null, "on-chain deposit " + txHash)
+                : null;
 
         Transfer transfer = transfers.transferWithin(config, chain, escrow, amount, key);
         return new Settlement(transition, transfer);
@@ -294,6 +317,25 @@ public class InvoiceSettlement {
      * transition it produced is on record next to it. Without this, the only safe thing a
      * retrying client could do is nothing.
      */
+    /**
+     * The chain's version of {@link #alreadyDone}, which tolerates a credit that moved
+     * money without advancing the invoice.
+     *
+     * <p>The stricter method treats a transfer with no matching transition as corruption,
+     * and everywhere else it is: the two are written in one transaction precisely so that
+     * neither can exist alone. A short on-chain deposit is the one legitimate exception,
+     * because it is credited on purpose and deliberately does not fund the invoice. Asking
+     * the strict question about it would turn every replay of that deposit into a failed
+     * pass.
+     */
+    private Optional<Settlement> alreadyCredited(
+            org.jooq.Configuration config, String invoiceId, String key, InvoiceStatus reached) {
+
+        return transfers.findByKeyWithin(config, key).map(transfer -> new Settlement(
+                invoices.findTransitionTo(config, invoiceId, reached).orElse(null),
+                transfer));
+    }
+
     private Optional<Settlement> alreadyDone(
             org.jooq.Configuration config, String invoiceId, String key, InvoiceStatus reached) {
 

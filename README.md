@@ -768,6 +768,10 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | Deposits buried past the finality depth are not asked about again | same |
 | A platform account namespace cannot be claimed from outside | `LedgerApiTest` |
 | The generic transfer endpoint will not pay out of a platform account | same |
+| A log that cannot be read is stepped over rather than ending the scan | `EscrowWatcherTest` |
+| A short deposit is credited and does not fund the invoice | same |
+| A deposit in the wrong currency is terminal, not retried for ever | same |
+| Both ends notice an uncredited deposit, even with no chain account | `ReconcilerTest` |
 
 ```bash
 mvn test
