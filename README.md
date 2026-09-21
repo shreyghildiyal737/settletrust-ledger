@@ -3,9 +3,9 @@
 A double-entry ledger for a cross-border trade settlement platform. Java 21, no framework
 in the domain core.
 
-This is the backend half of [SettleTrust](https://github.com/shreyghildiyal737), whose
-invoice lifecycle is modelled as an explicit state machine. This service is the part that
-moves the money.
+This is the backend half of SettleTrust, whose invoice lifecycle is modelled as an
+explicit twenty-state machine. This service is the part that moves the money. The
+frontend is not public.
 
 ## The invariant
 
