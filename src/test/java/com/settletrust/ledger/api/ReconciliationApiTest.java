@@ -2,6 +2,8 @@ package com.settletrust.ledger.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.settletrust.ledger.TestDatabases;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,6 +17,8 @@ import org.springframework.test.web.servlet.MvcResult;
 import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.notNullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -49,6 +53,9 @@ class ReconciliationApiTest {
 
     @Autowired
     private ObjectMapper json;
+
+    @Autowired
+    private MeterRegistry registry;
 
     @Test
     @DisplayName("a run is created, reported with its counts, and readable afterwards")
@@ -108,5 +115,34 @@ class ReconciliationApiTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.mode", is("FULL")))
                 .andExpect(jsonPath("$.checkedFrom", is(0)));
+    }
+
+    @Test
+    @DisplayName("a run asked for here counts the same as one the timer started")
+    void aRunAskedForHereIsRecorded() throws Exception {
+        // The schedule is off in this class, so nothing else can move these.
+        double countedBefore = fullRunsCounted();
+
+        mvc.perform(post("/api/v1/reconciliation/runs").param("deep", "true"))
+                .andExpect(status().isCreated());
+
+        assertEquals(countedBefore + 1, fullRunsCounted(),
+                "a deep run through the API was not counted");
+
+        // The staleness alarm is the one an operator answers by calling this endpoint, so
+        // it is the one the endpoint has to reset. It used to keep climbing, which left
+        // the alarm saying nobody had looked firing at the person who was looking.
+        double age = registry.get("settletrust.reconciliation.full.run.age").gauge().value();
+        assertTrue(age < 60,
+                "the full run age should have been reset by the run just made, was " + age);
+    }
+
+    /** Summed across outcomes: whether the book agreed is not what this is asking. */
+    private double fullRunsCounted() {
+        return registry.find("settletrust.reconciliation.runs")
+                .tag("mode", "full")
+                .counters().stream()
+                .mapToDouble(Counter::count)
+                .sum();
     }
 }

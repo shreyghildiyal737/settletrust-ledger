@@ -24,6 +24,18 @@ class InvoiceLifecycleSpec extends Specification {
         status << InvoiceStatus.values()
     }
 
+    def "a status is settleable exactly when settling is a move it may make"() {
+        expect: "the flag published to clients and the table agree, in both directions"
+        InvoiceRules.settleableNow(status) ==
+                InvoiceTransitions.isAllowed(status, InvoiceStatus.SETTLED)
+
+        and: "readiness is the wider question, so it can never be the narrower one's opposite"
+        !(InvoiceRules.settleableNow(status) && !InvoiceRules.readyForSettlement(status))
+
+        where:
+        status << InvoiceStatus.values()
+    }
+
     def "every status can be reached from a draft"() {
         given: "a walk of the table from the only state an invoice starts in"
         Set<InvoiceStatus> reached = [InvoiceStatus.DRAFT] as Set

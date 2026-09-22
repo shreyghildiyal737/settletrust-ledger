@@ -86,6 +86,7 @@ class InvoiceController {
             String status,
             int sequence,
             boolean readyForSettlement,
+            boolean settleableNow,
             List<String> blockedReasons,
             List<String> nextStates,
             Instant createdAt) {
@@ -102,6 +103,7 @@ class InvoiceController {
                     state.status().code(),
                     state.sequence(),
                     state.readyForSettlement(),
+                    state.settleableNow(),
                     state.blockedReasons(),
                     state.nextStates().stream().map(InvoiceStatus::code).toList(),
                     invoice.createdAt());
@@ -178,12 +180,19 @@ class InvoiceController {
             String account) {
     }
 
+    /**
+     * {@code replayed} is false the first time and true on every repeat, exactly as it is
+     * on a transfer. Without it a client that retried after a dropped connection gets an
+     * answer identical to the one it would have got had the retry been the payment, and
+     * cannot tell which of the two happened.
+     */
     record SettlementView(
             TransitionView transition,
             String fromAccount,
             String toAccount,
             long amountMinor,
-            String currency) {
+            String currency,
+            boolean replayed) {
 
         static SettlementView of(InvoiceSettlement.Settlement settlement) {
             return new SettlementView(
@@ -191,7 +200,8 @@ class InvoiceController {
                     settlement.transfer().from().value(),
                     settlement.transfer().to().value(),
                     settlement.transfer().amount().minorUnits(),
-                    settlement.transfer().amount().currency());
+                    settlement.transfer().amount().currency(),
+                    settlement.transfer().replayed());
         }
     }
 
@@ -206,9 +216,7 @@ class InvoiceController {
             @Valid @RequestBody PartyAccountRequest request) {
 
         AccountId buyer = fromClient(() -> AccountId.of(request.account()));
-        return ResponseEntity
-                .status(HttpStatus.CREATED)
-                .body(SettlementView.of(settlement.fundEscrow(id, buyer)));
+        return answer(SettlementView.of(settlement.fundEscrow(id, buyer)));
     }
 
     /** Releases the escrow to the seller and marks the invoice settled, in one transaction. */
@@ -218,9 +226,20 @@ class InvoiceController {
             @Valid @RequestBody PartyAccountRequest request) {
 
         AccountId seller = fromClient(() -> AccountId.of(request.account()));
+        return answer(SettlementView.of(settlement.settle(id, seller)));
+    }
+
+    /**
+     * 201 for work just done, 200 for work already done, as on {@code POST /transfers}.
+     *
+     * <p>These are the two endpoints most likely to be retried, because they are the two
+     * that move money, and a client that cannot tell a replay from a first payment is left
+     * to decide between asking again and doing nothing.
+     */
+    private static ResponseEntity<SettlementView> answer(SettlementView view) {
         return ResponseEntity
-                .status(HttpStatus.CREATED)
-                .body(SettlementView.of(settlement.settle(id, seller)));
+                .status(view.replayed() ? HttpStatus.OK : HttpStatus.CREATED)
+                .body(view);
     }
 
     /** As in {@link LedgerController}: only the client's own input becomes a 400. */

@@ -1,9 +1,7 @@
 package com.settletrust.ledger.api;
 
 import com.settletrust.ledger.reconciliation.Discrepancy;
-import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
 import com.settletrust.ledger.reconciliation.ReconciliationReport;
-import com.settletrust.ledger.reconciliation.Reconciler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -21,6 +19,11 @@ import java.util.Optional;
  * <p>Several instances may run this safely. The reconciler takes a lease before it
  * starts, so exactly one of them does the work and the others find it taken and go back
  * to sleep until their next tick.
+ *
+ * <p>The run itself goes through {@link ReconciliationRunner}, which is what records it.
+ * This class decides only what a scheduled run should say in the log, because a timer
+ * that failed and an operator whose request failed want different handling and the same
+ * metric.
  */
 @Component
 @ConditionalOnProperty(
@@ -29,18 +32,10 @@ class ReconciliationSchedule {
 
     private static final Logger log = LoggerFactory.getLogger(ReconciliationSchedule.class);
 
-    private final Reconciler reconciler;
-    private final PostgresReconciliationRuns runs;
-    private final ReconciliationMetrics metrics;
+    private final ReconciliationRunner runner;
 
-    ReconciliationSchedule(
-            Reconciler reconciler,
-            PostgresReconciliationRuns runs,
-            ReconciliationMetrics metrics) {
-
-        this.reconciler = reconciler;
-        this.runs = runs;
-        this.metrics = metrics;
+    ReconciliationSchedule(ReconciliationRunner runner) {
+        this.runner = runner;
     }
 
     @Scheduled(
@@ -49,30 +44,23 @@ class ReconciliationSchedule {
     void reconcile() {
         Optional<ReconciliationReport> completed;
         try {
-            completed = reconciler.run();
+            completed = runner.reconcile(false);
         } catch (RuntimeException failure) {
             // Swallowed deliberately: the scheduler cancels a task that throws, and a
             // reconciler that quietly stops after one bad night is worse than no
-            // reconciler, because the silence looks identical to a clean book.
+            // reconciler, because the silence looks identical to a clean book. The runner
+            // has already counted it.
             log.error("Reconciliation failed to complete", failure);
-            metrics.recordFailed();
             return;
         }
 
         if (completed.isEmpty()) {
             // Expected on every instance but one, so it is not a warning.
             log.info("Another instance holds the reconciliation lease, skipping this tick");
-            metrics.recordSkipped();
             return;
         }
 
         ReconciliationReport report = completed.get();
-        metrics.recordRun(report);
-        // Read back rather than derived from this report alone: what is open is a question
-        // about every run since the last full one, and this run is only the newest of them.
-        // Kept apart from the counter above so a run is always counted, even if this read
-        // ever comes back empty.
-        runs.openFindings().ifPresent(metrics::recordOpen);
         if (report.agreed()) {
             // The mode is logged with the counts because it is what they mean. Two
             // deposits checked by a full run is a two-deposit book; two checked by an

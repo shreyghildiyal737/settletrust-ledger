@@ -309,15 +309,6 @@ public class InvoiceSettlement {
     }
 
     /**
-     * The settlement this call is asking for, if it has already happened.
-     *
-     * <p>A client whose connection dropped mid-settlement must be able to ask again and
-     * get the same answer rather than an error it has to interpret. The transfer's
-     * idempotency key is the evidence: if money moved under it, the work is done, and the
-     * transition it produced is on record next to it. Without this, the only safe thing a
-     * retrying client could do is nothing.
-     */
-    /**
      * The chain's version of {@link #alreadyDone}, which tolerates a credit that moved
      * money without advancing the invoice.
      *
@@ -336,6 +327,15 @@ public class InvoiceSettlement {
                 transfer));
     }
 
+    /**
+     * The settlement this call is asking for, if it has already happened.
+     *
+     * <p>A client whose connection dropped mid-settlement must be able to ask again and
+     * get the same answer rather than an error it has to interpret. The transfer's
+     * idempotency key is the evidence: if money moved under it, the work is done, and the
+     * transition it produced is on record next to it. Without this, the only safe thing a
+     * retrying client could do is nothing.
+     */
     private Optional<Settlement> alreadyDone(
             org.jooq.Configuration config, String invoiceId, String key, InvoiceStatus reached) {
 

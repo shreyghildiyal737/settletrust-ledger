@@ -140,6 +140,11 @@ buyer  --250.00-->  escrow:inv-8a31c40e   (escrow_funded)
 ask again and gets the original transition and transfer back, flagged as a replay, with no
 second payment. The transfer's idempotency key is the evidence that the work was done.
 
+Both say so, too. A replay answers 200 and carries `"replayed": true`, where the first call
+answered 201, exactly as `POST /transfers` does. These are the two endpoints most likely to
+be retried, because they are the two that move money, and an answer a client cannot tell
+apart from the first one leaves it choosing between asking again and doing nothing.
+
 ## The chain rail
 
 The second way money arrives. An escrow can be funded from a bank account through the API,
@@ -487,6 +492,15 @@ settletrust_reconciliation_full_run_age_seconds   whether anyone has looked rece
   for: 15m
 ```
 
+**Every run updates these, including the one an operator asks for.** The two paths into
+the reconciler, the timer and `POST /runs`, go through one component that records the
+outcome, rather than the schedule recording its own. That seam is worth naming because of
+how it failed: the endpoint the section above calls the incident tool used to update
+nothing at all, so a deep run answered the staleness alarm without clearing it, and the
+counter meant to reveal a reconciler failing quietly could not see the runs most likely to
+fail. An alert that stays lit at the person who has just answered it is an alert that gets
+turned off.
+
 The chain rail has the same pair: `settletrust_chain_head_block` for where it has read to,
 and `settletrust_chain_pass_age_seconds` for whether it is still reading, because a
 stopped watcher leaves every other number frozen at something believable. Counters explain
@@ -551,12 +565,12 @@ at.
 | `GET /api/v1/accounts/{id}/entries` | Every entry against it, oldest first. |
 | `POST /api/v1/transfers` | Moves money. Requires an `Idempotency-Key` header. |
 | `POST /api/v1/invoices` | Opens an invoice in `draft`. |
-| `GET /api/v1/invoices/{id}` | Where it is, what blocks settlement, and what it may become next. |
+| `GET /api/v1/invoices/{id}` | Where it is, what blocks settlement, whether settling would be accepted right now, and what it may become next. |
 | `GET /api/v1/invoices/{id}/transitions` | Every step it has taken. |
 | `POST /api/v1/invoices/{id}/transitions` | Moves it, optionally guarded by `expected`. |
-| `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. |
-| `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. |
-| `POST /api/v1/reconciliation/runs` | Reconciles now. 201 whatever it finds: the run happened, and the verdict is in the body, with `mode` and `reservesChecked` saying what it covered and whether the chain was asked. `?deep=true` re-derives the whole book instead of the window since the last run, which is what to reach for in an incident. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
+| `POST /api/v1/invoices/{id}/escrow-funding` | Funds the escrow from the buyer and marks it funded, atomically. 201, or 200 on a replay. |
+| `POST /api/v1/invoices/{id}/settlement` | Releases the escrow to the seller and marks it settled, atomically. 201, or 200 on a replay. |
+| `POST /api/v1/reconciliation/runs` | Reconciles now, and is counted and timed like a scheduled run. 201 whatever it finds: the run happened, and the verdict is in the body, with `mode` and `reservesChecked` saying what it covered and whether the chain was asked. `?deep=true` re-derives the whole book instead of the window since the last run, which is what to reach for in an incident. 409 if another instance holds the lease, which is a different thing from a run that found problems and worth retrying. |
 | `GET /api/v1/reconciliation/runs/latest` | The last run and its findings. |
 | `GET /actuator/prometheus` | The metrics above. |
 | `GET /api/v1/reconciliation/findings/open` | What is still wrong, anchored on the last full run, with each finding's first and last sighting. The endpoint an alert should point at: `runs/latest` answers for a window. 404 when nothing has ever been reconciled, which is not the same as nothing being wrong. |
@@ -645,7 +659,7 @@ this repository that has not been operated, and no amount of valid YAML changes 
 
 ## Tests
 
-185 tests, all green: the domain rules in microseconds with no database, the storage layer
+256 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual
@@ -680,6 +694,10 @@ not "at least one finding" but "this finding, and nothing else wrong".
 | The unique constraint settles a real race on one key | same |
 | The database refuses an update or delete on `entry` | same |
 | A new transfer is 201, a replay is 200 and the same transfer | `LedgerApiTest` |
+| Funding an escrow twice, and settling twice, answer the replay as one | `InvoiceApiTest` |
+| An invoice is ready to settle before settling is a move it may make | same |
+| A status is settleable exactly when the table allows it to reach settled | `InvoiceLifecycleSpec` |
+| A run asked for over HTTP counts, and resets the staleness gauge | `ReconciliationApiTest` |
 | Every refusal reaches the status code it deserves, with a machine-readable reason | same |
 | A missing idempotency key is refused outright | same |
 | Every status has a transition row, and only `settled` and `cancelled` are final | `InvoiceStateMachineTest` |

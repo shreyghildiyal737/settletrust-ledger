@@ -91,4 +91,22 @@ public final class InvoiceRules {
     public static boolean readyForSettlement(InvoiceStatus status) {
         return blockedReasons(status).isEmpty();
     }
+
+    /**
+     * Whether the settlement operation would accept this invoice as it stands.
+     *
+     * <p>Deliberately a different question from {@link #readyForSettlement}, which mirrors
+     * the frontend's commercial view and is already true at {@code delivery_confirmed}:
+     * the escrow is funded, the goods arrived, and nothing is outstanding. Settling is
+     * still a move to {@code settled}, which the state machine allows only from
+     * {@code settlement_pending}, because deciding to pay is a step somebody takes rather
+     * than a consequence of delivery.
+     *
+     * <p>So an invoice can be ready and not yet settleable, and the two are named
+     * separately because a client branching on the first one to decide whether to call the
+     * settlement endpoint would be told 422 by a service that had just said it was ready.
+     */
+    public static boolean settleableNow(InvoiceStatus status) {
+        return InvoiceTransitions.isAllowed(status, InvoiceStatus.SETTLED);
+    }
 }

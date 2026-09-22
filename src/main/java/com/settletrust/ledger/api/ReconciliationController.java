@@ -1,7 +1,6 @@
 package com.settletrust.ledger.api;
 
 import com.settletrust.ledger.reconciliation.PostgresReconciliationRuns;
-import com.settletrust.ledger.reconciliation.Reconciler;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,11 +24,11 @@ import static com.settletrust.ledger.api.ReconciliationDtos.ReportView;
 @RequestMapping(path = "/api/v1/reconciliation")
 class ReconciliationController {
 
-    private final Reconciler reconciler;
+    private final ReconciliationRunner runner;
     private final PostgresReconciliationRuns runs;
 
-    ReconciliationController(Reconciler reconciler, PostgresReconciliationRuns runs) {
-        this.reconciler = reconciler;
+    ReconciliationController(ReconciliationRunner runner, PostgresReconciliationRuns runs) {
+        this.runner = runner;
         this.runs = runs;
     }
 
@@ -46,10 +45,15 @@ class ReconciliationController {
      * since the last run. It is what to reach for in an incident: the scheduled runs
      * answer for the last few minutes, and the question in an incident is never about the
      * last few minutes. It costs a full scan, which is why it is not the default.
+     *
+     * <p>It goes through {@link ReconciliationRunner} rather than calling the reconciler,
+     * so a run asked for here counts towards the same metrics as a scheduled one. A deep
+     * run is exactly what resets the staleness alarm, and an endpoint that did the work
+     * without saying so left that alarm firing at the operator who had just answered it.
      */
     @PostMapping("/runs")
     ResponseEntity<ReportView> runNow(@RequestParam(defaultValue = "false") boolean deep) {
-        return (deep ? reconciler.runFully() : reconciler.run())
+        return runner.reconcile(deep)
                 .map(report -> ResponseEntity.status(HttpStatus.CREATED).body(ReportView.of(report)))
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.CONFLICT).build());
     }

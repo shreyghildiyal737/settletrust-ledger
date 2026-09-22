@@ -171,7 +171,68 @@ class InvoiceApiTest {
         mvc.perform(get("/api/v1/invoices/{id}", invoiceId))
                 .andExpect(jsonPath("$.status", is("delivery_confirmed")))
                 .andExpect(jsonPath("$.readyForSettlement", is(true)))
-                .andExpect(jsonPath("$.blockedReasons.length()", is(0)));
+                .andExpect(jsonPath("$.blockedReasons.length()", is(0)))
+                // Ready, and not yet settleable. Nothing commercial is outstanding, but
+                // settling is a move to settled and the state machine allows that only
+                // from settlement_pending. A client branching on readiness alone to decide
+                // whether to call the settlement endpoint would be told 422 by a service
+                // that had just called the invoice ready, so both facts are published.
+                .andExpect(jsonPath("$.settleableNow", is(false)));
+    }
+
+    @Test
+    @DisplayName("the endpoints that move money answer a replay as one")
+    void aReplayedSettlementIsAnsweredAsAReplay() throws Exception {
+        for (String[] step : new String[][] {
+                {"submitted", "draft"},
+                {"buyer_accepted", "submitted"},
+                {"escrow_pending", "buyer_accepted"}}) {
+            transition(step[0], step[1], null).andExpect(status().isCreated());
+        }
+
+        openAccount("house-" + invoiceId, "HOUSE");
+        openAccount("buyer-" + invoiceId, "CUSTOMER");
+        openAccount("seller-" + invoiceId, "CUSTOMER");
+        fundAccount("house-" + invoiceId, "buyer-" + invoiceId, 250_000L);
+
+        fundEscrow().andExpect(status().isCreated())
+                .andExpect(jsonPath("$.replayed", is(false)));
+
+        // The retry a dropped connection produces. The money must not move again, and the
+        // caller has to be able to tell that it did not.
+        fundEscrow().andExpect(status().isOk())
+                .andExpect(jsonPath("$.replayed", is(true)))
+                .andExpect(jsonPath("$.amountMinor", is(250000)));
+
+        transition("delivery_confirmed", "escrow_funded", null).andExpect(status().isCreated());
+        transition("settlement_pending", "delivery_confirmed", null).andExpect(status().isCreated());
+
+        mvc.perform(get("/api/v1/invoices/{id}", invoiceId))
+                .andExpect(jsonPath("$.settleableNow", is(true)));
+
+        settle().andExpect(status().isCreated())
+                .andExpect(jsonPath("$.transition.to", is("settled")))
+                .andExpect(jsonPath("$.replayed", is(false)));
+
+        settle().andExpect(status().isOk())
+                .andExpect(jsonPath("$.transition.to", is("settled")))
+                .andExpect(jsonPath("$.replayed", is(true)));
+
+        // Paid once, whatever the caller did.
+        mvc.perform(get("/api/v1/accounts/{id}", "seller-" + invoiceId))
+                .andExpect(jsonPath("$.balanceMinor", is(250000)));
+    }
+
+    private ResultActions fundEscrow() throws Exception {
+        return mvc.perform(post("/api/v1/invoices/{id}/escrow-funding", invoiceId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(Map.of("account", "buyer-" + invoiceId))));
+    }
+
+    private ResultActions settle() throws Exception {
+        return mvc.perform(post("/api/v1/invoices/{id}/settlement", invoiceId)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content(json.writeValueAsString(Map.of("account", "seller-" + invoiceId))));
     }
 
     private void openAccount(String id, String kind) throws Exception {

@@ -18,6 +18,11 @@ public record InvoiceState(Invoice invoice, InvoiceStatus status, int sequence) 
         return InvoiceRules.readyForSettlement(status);
     }
 
+    /** Whether {@code POST /settlement} would be accepted now. See the rule for why these differ. */
+    public boolean settleableNow() {
+        return InvoiceRules.settleableNow(status);
+    }
+
     public List<InvoiceStatus> nextStates() {
         return InvoiceTransitions.allowedFrom(status).stream()
                 .sorted()
