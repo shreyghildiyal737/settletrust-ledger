@@ -608,6 +608,39 @@ mvn spring-boot:run
 
 Reads `LEDGER_JDBC_URL`, `LEDGER_DB_USER` and `LEDGER_DB_PASSWORD`, and migrates on start.
 
+## Running it in public
+
+`render.yaml` describes a demo on Render's free plan, built from the same `Dockerfile`,
+against a Postgres on Neon's free tier. Render's own free database is deleted after thirty
+days, and a ledger that loses its book on a timer demonstrates nothing.
+
+**Reads are open and writes need a key.** Set `LEDGER_API_WRITE_KEY` and every request
+other than `GET`, `HEAD` or `OPTIONS` must carry it as `X-Api-Key`, compared in constant
+time. A key under 32 characters stops the service starting, because a guessable key is
+worse than none: it looks like protection. Leave the variable unset and there is no filter
+at all, which is how every local run and every other test behaves. This exists so a
+reviewer can open the book without asking and a stranger cannot fill it. It is not the
+service's security model, and a real deployment would sit behind the platform's own
+authentication.
+
+The free instance has 512 MB, so the blueprint trims the pool to four connections and runs
+the serial collector at 60% of memory. Rehearsed locally under a 512 MB limit first: it
+migrated an empty schema, passed the smoke test and peaked at about 226 MB.
+
+`scripts/smoke.sh` walks one invoice from draft to settled and asserts every status code
+along the way, including a replay, a refused overdraft and the refusal to assert
+`escrow_funded` without money, then finishes with a deep reconciliation expecting an empty
+list. It needs only bash and curl:
+
+```bash
+BASE=https://<service>.onrender.com KEY=<write key> scripts/smoke.sh
+```
+
+The chain rail is off in public. The escrow contract has never been on a public network,
+and the demo does not pretend otherwise, so every report there says
+`reservesChecked: false`. The free instance also sleeps when idle, and the first request
+after that takes most of a minute, which is a cold JVM rather than a fault.
+
 ## Running it in a cluster
 
 ```bash
@@ -659,7 +692,7 @@ this repository that has not been operated, and no amount of valid YAML changes 
 
 ## Tests
 
-256 tests, all green: the domain rules in microseconds with no database, the storage layer
+261 tests, all green: the domain rules in microseconds with no database, the storage layer
 against a real PostgreSQL, and the HTTP contract against the running application context.
 The
 concurrency tests release every thread from a barrier at the same instant, one virtual

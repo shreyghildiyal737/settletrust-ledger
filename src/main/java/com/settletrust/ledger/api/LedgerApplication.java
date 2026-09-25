@@ -1,5 +1,6 @@
 package com.settletrust.ledger.api;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.settletrust.ledger.PostgresLedger;
 import com.settletrust.ledger.PostgresTransferService;
 import com.settletrust.ledger.Transfers;
@@ -152,6 +153,17 @@ public class LedgerApplication {
             ObjectProvider<EscrowReserves> reserves,
             @Value("${ledger.reconciliation.deep-interval:PT24H}") Duration deepInterval) {
         return new Reconciler(dsl, clock, runs, reserves.getIfAvailable(), deepInterval);
+    }
+
+    /**
+     * Only for a deployment reachable from the internet. Unset, there is no filter at all
+     * rather than one that lets everything through, so nothing about a local run changes.
+     */
+    @Bean
+    @ConditionalOnProperty("ledger.api.write-key")
+    WriteKeyFilter writeKeyFilter(
+            @Value("${ledger.api.write-key}") String key, ObjectMapper json) {
+        return new WriteKeyFilter(key, json);
     }
 
     @Bean

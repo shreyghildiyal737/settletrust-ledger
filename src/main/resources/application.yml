@@ -10,7 +10,7 @@ spring:
       pool-name: settletrust-ledger
       # Each transfer holds a row lock for the length of its transaction, so a caller
       # waiting on a busy account should be waiting on the lock, not on the pool.
-      maximum-pool-size: 16
+      maximum-pool-size: ${LEDGER_DB_POOL_SIZE:16}
 
   flyway:
     enabled: true
