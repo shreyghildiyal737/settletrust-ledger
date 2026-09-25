@@ -46,6 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The runner's default docker driver cannot export to the Actions cache, so the
+      # cache lines below fail the build without this.
+      - uses: docker/setup-buildx-action@v3
+
       # Built and not pushed. There is no registry to push to yet, and a build that
       # fails only at deploy time is a build that was not really checked.
       - name: Build the image
